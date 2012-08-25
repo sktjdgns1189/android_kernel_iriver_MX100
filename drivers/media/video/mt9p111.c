@@ -1,0 +1,6524 @@
+/*
+ * Driver for mt9p111/MT9M112 CMOS Image Sensor from Micron
+ *
+ * Copyright (C) 2008, Robert Jarzmik <robert.jarzmik@free.fr>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ */
+#include <linux/videodev2.h>
+#include <linux/videodev2_samsung.h>
+#include <linux/slab.h>
+#include <linux/i2c.h>
+#include <linux/log2.h>
+#include <linux/gpio.h>
+#include <linux/delay.h>
+
+#include <media/v4l2-common.h>
+#include <media/v4l2-chip-ident.h>
+#include <media/soc_camera.h>
+
+/*
+ * mt9p111 and mt9m112 i2c address is 0x5d or 0x48 (depending on SAddr pin)
+ * The platform has to define i2c_board_info and call i2c_register_board_info()
+ */
+
+/* mt9p111: Sensor register addresses */
+#define MT9P111_CHIP_VERSION		0x000
+#define MT9P111_ROW_START		0x001
+#define MT9P111_COLUMN_START		0x002
+#define MT9P111_WINDOW_HEIGHT		0x003
+#define MT9P111_WINDOW_WIDTH		0x004
+#define MT9P111_HORIZONTAL_BLANKING_B	0x005
+#define MT9P111_VERTICAL_BLANKING_B	0x006
+#define MT9P111_HORIZONTAL_BLANKING_A	0x007
+#define MT9P111_VERTICAL_BLANKING_A	0x008
+#define MT9P111_SHUTTER_WIDTH		0x009
+#define MT9P111_ROW_SPEED		0x00a
+#define MT9P111_EXTRA_DELAY		0x00b
+#define MT9P111_SHUTTER_DELAY		0x00c
+#define MT9P111_RESET			0x00d
+#define MT9P111_READ_MODE_B		0x020
+#define MT9P111_READ_MODE_A		0x021
+#define MT9P111_FLASH_CONTROL		0x023
+#define MT9P111_GREEN1_GAIN		0x02b
+#define MT9P111_BLUE_GAIN		0x02c
+#define MT9P111_RED_GAIN		0x02d
+#define MT9P111_GREEN2_GAIN		0x02e
+#define MT9P111_GLOBAL_GAIN		0x02f
+#define MT9P111_CONTEXT_CONTROL		0x0c8
+#define MT9P111_PAGE_MAP		0x0f0
+#define MT9P111_BYTE_WISE_ADDR		0x0f1
+
+#define MT9P111_RESET_SYNC_CHANGES	(1 << 15)
+#define MT9P111_RESET_RESTART_BAD_FRAME	(1 << 9)
+#define MT9P111_RESET_SHOW_BAD_FRAMES	(1 << 8)
+#define MT9P111_RESET_RESET_SOC		(1 << 5)
+#define MT9P111_RESET_OUTPUT_DISABLE	(1 << 4)
+#define MT9P111_RESET_CHIP_ENABLE	(1 << 3)
+#define MT9P111_RESET_ANALOG_STANDBY	(1 << 2)
+#define MT9P111_RESET_RESTART_FRAME	(1 << 1)
+#define MT9P111_RESET_RESET_MODE	(1 << 0)
+
+#define MT9P111_RMB_MIRROR_COLS		(1 << 1)
+#define MT9P111_RMB_MIRROR_ROWS		(1 << 0)
+#define MT9P111_CTXT_CTRL_RESTART	(1 << 15)
+#define MT9P111_CTXT_CTRL_DEFECTCOR_B	(1 << 12)
+#define MT9P111_CTXT_CTRL_RESIZE_B	(1 << 10)
+#define MT9P111_CTXT_CTRL_CTRL2_B	(1 << 9)
+#define MT9P111_CTXT_CTRL_GAMMA_B	(1 << 8)
+#define MT9P111_CTXT_CTRL_XENON_EN	(1 << 7)
+#define MT9P111_CTXT_CTRL_READ_MODE_B	(1 << 3)
+#define MT9P111_CTXT_CTRL_LED_FLASH_EN	(1 << 2)
+#define MT9P111_CTXT_CTRL_VBLANK_SEL_B	(1 << 1)
+#define MT9P111_CTXT_CTRL_HBLANK_SEL_B	(1 << 0)
+/*
+ * mt9p111: Colorpipe register addresses (0x100..0x1ff)
+ */
+#define MT9P111_OPER_MODE_CTRL		0x106
+#define MT9P111_OUTPUT_FORMAT_CTRL	0x108
+#define MT9P111_REDUCER_XZOOM_B		0x1a0
+#define MT9P111_REDUCER_XSIZE_B		0x1a1
+#define MT9P111_REDUCER_YZOOM_B		0x1a3
+#define MT9P111_REDUCER_YSIZE_B		0x1a4
+#define MT9P111_REDUCER_XZOOM_A		0x1a6
+#define MT9P111_REDUCER_XSIZE_A		0x1a7
+#define MT9P111_REDUCER_YZOOM_A		0x1a9
+#define MT9P111_REDUCER_YSIZE_A		0x1aa
+
+#define MT9P111_OUTPUT_FORMAT_CTRL2_A	0x13a
+#define MT9P111_OUTPUT_FORMAT_CTRL2_B	0x19b
+
+#define MT9P111_OPMODE_AUTOEXPO_EN	(1 << 14)
+#define MT9P111_OPMODE_AUTOWHITEBAL_EN	(1 << 1)
+
+#define MT9P111_OUTFMT_PROCESSED_BAYER	(1 << 14)
+#define MT9P111_OUTFMT_BYPASS_IFP	(1 << 10)
+#define MT9P111_OUTFMT_INV_PIX_CLOCK	(1 << 9)
+#define MT9P111_OUTFMT_RGB		(1 << 8)
+#define MT9P111_OUTFMT_RGB565		(0x0 << 6)
+#define MT9P111_OUTFMT_RGB555		(0x1 << 6)
+#define MT9P111_OUTFMT_RGB444x		(0x2 << 6)
+#define MT9P111_OUTFMT_RGBx444		(0x3 << 6)
+#define MT9P111_OUTFMT_TST_RAMP_OFF	(0x0 << 4)
+#define MT9P111_OUTFMT_TST_RAMP_COL	(0x1 << 4)
+#define MT9P111_OUTFMT_TST_RAMP_ROW	(0x2 << 4)
+#define MT9P111_OUTFMT_TST_RAMP_FRAME	(0x3 << 4)
+#define MT9P111_OUTFMT_SHIFT_3_UP	(1 << 3)
+#define MT9P111_OUTFMT_AVG_CHROMA	(1 << 2)
+#define MT9P111_OUTFMT_SWAP_YCbCr_C_Y	(1 << 1)
+#define MT9P111_OUTFMT_SWAP_RGB_EVEN	(1 << 1)
+#define MT9P111_OUTFMT_SWAP_YCbCr_Cb_Cr	(1 << 0)
+/*
+ * mt9p111: Camera control register addresses (0x200..0x2ff not implemented)
+ */
+
+#define reg_read(reg) mt9p111_reg_read(client, MT9P111_##reg)
+#define reg_write(reg, val) mt9p111_reg_write(client, MT9P111_##reg, (val))
+#define reg_set(reg, val) mt9p111_reg_set(client, MT9P111_##reg, (val))
+#define reg_clear(reg, val) mt9p111_reg_clear(client, MT9P111_##reg, (val))
+
+#define MT9P111_MIN_DARK_ROWS	8
+#define MT9P111_MIN_DARK_COLS	24
+#define MT9P111_MAX_HEIGHT	1024
+#define MT9P111_MAX_WIDTH	1280
+
+#define COL_FMT(_name, _depth, _fourcc, _colorspace) \
+	{ .name = _name, .depth = _depth, .fourcc = _fourcc, \
+	.colorspace = _colorspace }
+#define RGB_FMT(_name, _depth, _fourcc) \
+	COL_FMT(_name, _depth, _fourcc, V4L2_COLORSPACE_SRGB)
+#define JPG_FMT(_name, _depth, _fourcc) \
+	COL_FMT(_name, _depth, _fourcc, V4L2_COLORSPACE_JPEG)
+
+static const struct soc_camera_data_format mt9p111_colour_formats[] = {
+	JPG_FMT("CbYCrY 16 bit", 16, V4L2_PIX_FMT_UYVY),
+	JPG_FMT("CrYCbY 16 bit", 16, V4L2_PIX_FMT_VYUY),
+	JPG_FMT("YCbYCr 16 bit", 16, V4L2_PIX_FMT_YUYV),
+	JPG_FMT("YCrYCb 16 bit", 16, V4L2_PIX_FMT_YVYU),
+	RGB_FMT("RGB 565", 16, V4L2_PIX_FMT_RGB565),
+	RGB_FMT("RGB 555", 16, V4L2_PIX_FMT_RGB555),
+	RGB_FMT("Bayer (sRGB) 10 bit", 10, V4L2_PIX_FMT_SBGGR16),
+	RGB_FMT("Bayer (sRGB) 8 bit", 8, V4L2_PIX_FMT_SBGGR8),
+};
+
+int camera_current_preview_width = 0; //liujianhua add
+
+/*
+ * mt9p111: Camera Bright
+ */
+#define MT9P111_BRIGHT_REDUCE2     1
+#define MT9P111_BRIGHT_REDUCE1_5   2
+#define MT9P111_BRIGHT_REDUCE1     3
+#define MT9P111_BRIGHT_REDUCE0_5   4
+#define MT9P111_BRIGHT_0           5
+#define MT9P111_BRIGHT_INCREASE0_5 6
+#define MT9P111_BRIGHT_INCREASE1   7
+#define MT9P111_BRIGHT_INCREASE1_5 8
+#define MT9P111_BRIGHT_INCREASE2   9
+/*
+ * mt9p111: Camera Capture Resolution
+ */
+#define MT9P111_CAPTURE_RESOLUTION_2592X1944 (2592*1944)
+#define MT9P111_CAPTURE_RESOLUTION_2048X1536 (2048*1536)
+#define MT9P111_CAPTURE_RESOLUTION_1600X1200 (1600*1200)
+#define MT9P111_CAPTURE_RESOLUTION_1296X972  (1296*792)
+#define MT9P111_CAPTURE_RESOLUTION_1280X960  (1280*960)
+#define MT9P111_CAPTURE_RESOLUTION_1280X720  (1280*720)
+#define MT9P111_CAPTURE_RESOLUTION_1024X768  (1024*768)
+#define MT9P111_CAPTURE_RESOLUTION_800X600   (800*600)
+#define MT9P111_CAPTURE_RESOLUTION_640X480   (640*480)
+#define MT9P111_CAPTURE_RESOLUTION_512X384   (512*384)
+#define MT9P111_CAPTURE_RESOLUTION_400X300   (400*300)
+/*
+ * mt9p111: Camera Full scan Single Mode
+ */
+//#define AF_FULL_SCAN_MODE 1
+#define MACRO_MODE 1
+
+/*
+ * mt9p111: Camera Contunuous Mode
+ */
+//#define AF_CONTINUOUS_MODE 2
+#define INFINITY_MODE 2
+
+/*
+ * mt9p111: Camera Full Scan Trigger
+ */
+#define FULL_SCAN_AUTO_FOCUS_EXECUTION 3
+/*
+ * mt9p111: Camera SF Mode 9 
+ */
+#define MT9T111_DEFAULT_AF_AREA (FULL_SCAN_AUTO_FOCUS_EXECUTION+1)
+#define MT9P111_SF_UP_LEFT      (FULL_SCAN_AUTO_FOCUS_EXECUTION+2)
+#define MT9P111_SF_UP_MID       (FULL_SCAN_AUTO_FOCUS_EXECUTION+3)
+#define MT9P111_SF_UP_RIGHT     (FULL_SCAN_AUTO_FOCUS_EXECUTION+4)
+#define MT9P111_SF_MID_LEFT     (FULL_SCAN_AUTO_FOCUS_EXECUTION+5)
+#define MT9P111_SF_MID_MID      (FULL_SCAN_AUTO_FOCUS_EXECUTION+6)
+#define MT9P111_SF_MID_RIGHT    (FULL_SCAN_AUTO_FOCUS_EXECUTION+7)
+#define MT9P111_SF_DOWN_LEFT    (FULL_SCAN_AUTO_FOCUS_EXECUTION+8)
+#define MT9P111_SF_DOWN_MID     (FULL_SCAN_AUTO_FOCUS_EXECUTION+9)
+#define MT9P111_SF_DOWN_RIGHT   (FULL_SCAN_AUTO_FOCUS_EXECUTION+10)
+/*
+ * mt9p111: Camera Manual Focus
+ */
+#define MT9P111_MANUAL_FOCUS_1  (MT9P111_SF_DOWN_RIGHT+1)
+#define MT9P111_MANUAL_FOCUS_2  (MT9P111_SF_DOWN_RIGHT+2)
+#define MT9P111_MANUAL_FOCUS_3  (MT9P111_SF_DOWN_RIGHT+3)
+#define MT9P111_MANUAL_FOCUS_4  (MT9P111_SF_DOWN_RIGHT+4)
+#define MT9P111_MANUAL_FOCUS_5  (MT9P111_SF_DOWN_RIGHT+5)
+#define MT9P111_MANUAL_FOCUS_6  (MT9P111_SF_DOWN_RIGHT+6)
+#define MT9P111_MANUAL_FOCUS_7  (MT9P111_SF_DOWN_RIGHT+7)
+#define MT9P111_MANUAL_FOCUS_8  (MT9P111_SF_DOWN_RIGHT+8)
+#define MT9P111_MANUAL_FOCUS_9  (MT9P111_SF_DOWN_RIGHT+9)
+#define MT9P111_MANUAL_FOCUS_10 (MT9P111_SF_DOWN_RIGHT+10)
+/*
+ * mt9p111: Camera White Balance
+ */
+#define MT9P111_WB_AUTO         1
+#define MT9P111_WB_INCANDESCENT 2
+#define MT9P111_WB_FLUORESCENT  3
+#define MT9P111_WB_DAYLIGHT     4
+#define MT9P111_WB_CLOUDY       5
+/*
+ * mt9p111: Camera Effect
+ */
+#define MT9P111_EFFECT_NONE     0
+#define MT9P111_EFFECT_GRAY     1
+#define MT9P111_EFFECT_NEGATIVE 2
+#define MT9P111_EFFECT_SEPIA    3
+#define MT9P111_EFFECT_AQUA     4
+#define MT9P111_EFFECT_SOLARIZE 6
+
+/*
+ * mt9p111: Camera SNAPSHOT/Movie Mode
+ */
+#define MT9P111_SNAPSHOT_MODE 1
+#define MT9P111_MOVIE_MODE    2
+/*
+ * mt9p111: Camera Reflect
+ */
+#define MT9P111_REFLECT_NONE         1
+#define MT9P111_REFLECT_MIRROR       2
+#define MT9P111_REFLECT_WATER        3
+#define MT9P111_REFLECT_MIRROR_WATER 4
+/*
+ * mt9p111: Camera Scene
+ */
+#define MT9P111_NORMAL    0
+#define MT9P111_PORTRAIT  1
+#define MT9P111_LANDSCAPE 2
+#define MT9P111_SPORTS    3
+#define MT9P111_SUNSET    4
+#define MT9P111_INDOOR    5
+#define MT9P111_WINTER    6
+#define MT9P111_TEXT      7
+#define MT9P111_NIGHT     8
+#define MT9P111_BEACH     9
+#define MT9P111_PARTY     10
+
+/*
+ * mt9p111: Camera Scene
+ */
+#define MT9P111_SOC_ISO_AUTO 0
+#define MT9P111_SOC_ISO_50  1
+#define MT9P111_SOC_ISO_100 2
+#define MT9P111_SOC_ISO_200 3
+#define MT9P111_SOC_ISO_400 4
+#define MT9P111_SOC_ISO_800 5
+
+#define MT9P111_FRAME_RATE_AUTO 0
+#define MT9P111_FRAME_RATE_7FPS 7
+#define MT9P111_FRAME_RATE_15FPS 15
+#define MT9P111_FRAME_RATE_20FPS 20
+
+struct mt9p111_reg_cfg
+{
+	u16 addr;
+	u16 val;
+	u8  flag;// comment: 1:2bytes;0:1byte
+};
+
+struct mt9p111_reg_cfg_burst
+{
+	u16 addr;
+	u16 val[8];
+	u8  len;// U16 number  
+};
+
+#if 0
+struct mt9p111_reg_cfg mt9p11_init_regs[]=
+{
+	{0x0010, 0x0340},
+	{0x0012, 0x0090},
+	{0x0014, 0x2025},
+	{0x001E, 0x0665},
+	{0x0022, 0x01E0},
+	{0x002A, 0x7F7F},
+	{0x002C, 0x0000},
+	{0x002E, 0x0000}
+};
+
+struct mt9p111_reg_cfg 	mt9p11_preview_with_high_power_mode[]=
+{
+
+	{0xC83A, 0x000C},
+	{0xC83C, 0x0018},
+	{0xC83E, 0x07B1},
+	{0xC840, 0x0A45},
+	{0xC842, 0x0001},
+	{0xC844, 0x0103},
+	{0xC846, 0x0103},
+	{0xC848, 0x0103},
+	{0xC84A, 0x0103},
+	{0xC84C, 0x00F6},
+	{0xC84E, 0x0001},
+	{0xC850, 0x00 	},
+	{0xC851, 0x00 	},
+	{0xC852, 0x019C},
+	{0xC854, 0x0732},
+	{0xC858, 0x0000},
+	{0xC85A, 0x0001},
+	{0xC85C, 0x0423},
+	{0xC85E, 0xFFFF},
+	{0xC860, 0x0423},
+	{0xC862, 0x1194},
+	{0xC864, 0xFFFE},
+	{0xC866, 0x7F7F},
+	{0xC868, 0x0423},
+	{0xC86A, 0x1194},
+	{0xC86C, 0x0518},
+	{0xC86E, 0x03D4},
+	{0xC870, 0x0014},
+	{0xC858, 0x0002},
+	{0xC8B8, 0x0004},
+	{0xC8AE, 0x0001},
+	{0xC8AA, 0x0500},
+	{0xC8AC, 0x03C0}
+};
+
+/*[Preview_power]    */
+struct mt9p111_reg_cfg 	preview_power[]=
+{
+                                                                                                   
+	{0x3EDA, 0x6060},	 // DAC_LD_14_15                                                                                 
+	{0x098E, 0x843C},	 // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_5_MAX_FRAME_CNT]                                       
+	{0x843C, 0x01 	}, // SEQ_STATE_CFG_5_MAX_FRAME_CNT                                                                  
+	{0x8404, 0x01 	},  // SEQ_CMD         
+
+};
+#endif
+
+struct mt9p111_reg_cfg 	mt9p111_init0[]=
+{
+	{0x0010, 0x0340, 1}, 	// PLL_DIVIDERS
+	{0x0012, 0x0090, 1}, 	// PLL_P_DIVIDERS
+	{0x0014, 0x2025, 1}, 	// PLL_CONTROL
+	{0x001E, 0x0665, 1}, 	// PAD_SLEW_PAD_CONFIG
+	{0x0022, 0x0030, 1}, 	// VDD_DIS_COUNTER
+	{0x002A, 0x7F7F, 1}, 	// PLL_P4_P5_P6_DIVIDERS
+	{0x002C, 0x0000, 1}, 	// PLL_P7_DIVIDER
+	{0x002E, 0x0000, 1}, 	// SENSOR_CLOCK_DIVIDER
+	{0x0018, 0x4008, 1}, 	// STANDBY_CONTROL_AND_STATUS
+};
+
+struct mt9p111_reg_cfg 	mt9p111_init1[]=
+{
+	{0x0010, 0x0340, 1}, 	// PLL_DIVIDERS
+	{0x098E, 0x483A, 1}, 	// LOGICAL_ADDRESS_ACCESS
+	{0xC83A, 0x000C, 1}, 	// CAM_CORE_A_Y_ADDR_START
+	{0xC83C, 0x0018, 1}, 	// CAM_CORE_A_X_ADDR_START
+	{0xC83E, 0x07B1, 1}, 	// CAM_CORE_A_Y_ADDR_END
+	{0xC840, 0x0A45, 1}, 	// CAM_CORE_A_X_ADDR_END
+	{0xC842, 0x0001, 1}, 	// CAM_CORE_A_ROW_SPEED
+	{0xC844, 0x0103, 1}, 	// CAM_CORE_A_SKIP_X_CORE
+	{0xC846, 0x0103, 1}, 	// CAM_CORE_A_SKIP_Y_CORE
+	{0xC848, 0x0103, 1}, 	// CAM_CORE_A_SKIP_X_PIPE
+	{0xC84A, 0x0103, 1}, 	// CAM_CORE_A_SKIP_Y_PIPE
+	{0xC84C, 0x0096, 1}, 	// CAM_CORE_A_POWER_MODE
+	{0xC84E, 0x0001, 1}, 	// CAM_CORE_A_BIN_MODE
+	{0xC850, 0x00, 0}, 	// CAM_CORE_A_ORIENTATION
+	{0xC851, 0x00, 0}, 	// CAM_CORE_A_PIXEL_ORDER
+	{0xC852, 0x019C, 1}, 	// CAM_CORE_A_FINE_CORRECTION
+	{0xC854, 0x0732, 1}, 	// CAM_CORE_A_FINE_ITMIN
+	{0xC858, 0x0000, 1}, 	// CAM_CORE_A_COARSE_ITMIN
+	{0xC85A, 0x0001, 1}, 	// CAM_CORE_A_COARSE_ITMAX_MARGIN
+	{0xC85C, 0x0423, 1}, 	// CAM_CORE_A_MIN_FRAME_LENGTH_LINES
+	{0xC85E, 0xFFFF, 1}, 	// CAM_CORE_A_MAX_FRAME_LENGTH_LINES
+	{0xC860, 0x0423, 1}, 	// CAM_CORE_A_BASE_FRAME_LENGTH_LINES
+	{0xC862, 0x1194, 1}, 	// CAM_CORE_A_MIN_LINE_LENGTH_PCLK
+	{0xC864, 0xFFFE, 1}, 	// CAM_CORE_A_MAX_LINE_LENGTH_PCLK
+	{0xC866, 0x7F7F, 1}, 	// CAM_CORE_A_P4_5_6_DIVIDER
+	{0xC868, 0x0423, 1}, 	// CAM_CORE_A_FRAME_LENGTH_LINES
+	{0xC86A, 0x1194, 1}, 	// CAM_CORE_A_LINE_LENGTH_PCK
+	{0xC86C, 0x0518, 1}, 	// CAM_CORE_A_OUTPUT_SIZE_WIDTH
+	{0xC86E, 0x03D4, 1}, 	// CAM_CORE_A_OUTPUT_SIZE_HEIGHT
+	{0xC870, 0x0014, 1}, 	// CAM_CORE_A_RX_FIFO_TRIGGER_MARK
+	{0xC858, 0x0002, 1}, 	// CAM_CORE_A_COARSE_ITMIN
+	{0xC8B8, 0x0004, 1}, 	// CAM_OUTPUT_0_JPEG_CONTROL
+	{0xC8AE, 0x0001, 1}, 	// CAM_OUTPUT_0_OUTPUT_FORMAT
+	{0xC8AA, 0x0500, 1}, 	// CAM_OUTPUT_0_IMAGE_WIDTH
+	{0xC8AC, 0x03C0, 1}, 	// CAM_OUTPUT_0_IMAGE_HEIGHT
+	{0x098E, 0x4872, 1}, 	// LOGICAL_ADDRESS_ACCESS
+	{0xC872, 0x0010, 1}, 	// CAM_CORE_B_Y_ADDR_START
+	{0xC874, 0x001C, 1}, 	// CAM_CORE_B_X_ADDR_START
+	{0xC876, 0x07AF, 1}, 	// CAM_CORE_B_Y_ADDR_END
+	{0xC878, 0x0A43, 1}, 	// CAM_CORE_B_X_ADDR_END
+	{0xC87A, 0x0001, 1}, 	// CAM_CORE_B_ROW_SPEED
+	{0xC87C, 0x0101, 1}, 	// CAM_CORE_B_SKIP_X_CORE
+	{0xC87E, 0x0101, 1}, 	// CAM_CORE_B_SKIP_Y_CORE
+	{0xC880, 0x0101, 1}, 	// CAM_CORE_B_SKIP_X_PIPE
+	{0xC882, 0x0101, 1}, 	// CAM_CORE_B_SKIP_Y_PIPE
+	{0xC884, 0x005C, 1}, 	// CAM_CORE_B_POWER_MODE
+	{0xC886, 0x0000, 1}, 	// CAM_CORE_B_BIN_MODE
+	{0xC888, 0x00, 0}, 	// CAM_CORE_B_ORIENTATION
+	{0xC889, 0x00, 0}, 	// CAM_CORE_B_PIXEL_ORDER
+	{0xC88A, 0x009C, 1}, 	// CAM_CORE_B_FINE_CORRECTION
+	{0xC88C, 0x034A, 1}, 	// CAM_CORE_B_FINE_ITMIN
+	{0xC890, 0x0000, 1}, 	// CAM_CORE_B_COARSE_ITMIN
+	{0xC892, 0x0001, 1}, 	// CAM_CORE_B_COARSE_ITMAX_MARGIN
+	{0xC894, 0x07EF, 1}, 	// CAM_CORE_B_MIN_FRAME_LENGTH_LINES
+	{0xC896, 0xFFFF, 1}, 	// CAM_CORE_B_MAX_FRAME_LENGTH_LINES
+	{0xC898, 0x082F, 1}, 	// CAM_CORE_B_BASE_FRAME_LENGTH_LINES
+	{0xC89A, 0x1964, 1}, 	// CAM_CORE_B_MIN_LINE_LENGTH_PCLK
+	{0xC89C, 0xFFFE, 1}, 	// CAM_CORE_B_MAX_LINE_LENGTH_PCLK
+	{0xC89E, 0x7F7F, 1}, 	// CAM_CORE_B_P4_5_6_DIVIDER
+	{0xC8A0, 0x07EF, 1}, 	// CAM_CORE_B_FRAME_LENGTH_LINES
+	{0xC8A2, 0x1964, 1}, 	// CAM_CORE_B_LINE_LENGTH_PCK
+	{0xC8A4, 0x0A28, 1}, 	// CAM_CORE_B_OUTPUT_SIZE_WIDTH
+	{0xC8A6, 0x07A2, 1}, 	// CAM_CORE_B_OUTPUT_SIZE_HEIGHT
+	{0xC8A8, 0x0124, 1}, 	// CAM_CORE_B_RX_FIFO_TRIGGER_MARK
+	{0xC890, 0x0002, 1}, 	// CAM_CORE_B_COARSE_ITMIN
+	{0xC8C0, 0x0A20, 1}, 	// CAM_OUTPUT_1_IMAGE_WIDTH
+	{0xC89A, 0x1964, 1}, 	// CAM_CORE_B_MIN_LINE_LENGTH_PCLK
+	{0xC8A2, 0x1964, 1}, 	// CAM_CORE_B_LINE_LENGTH_PCK
+	{0xC8C4, 0x0001, 1}, 	// CAM_OUTPUT_1_OUTPUT_FORMAT
+	{0xC8C6, 0x0000, 1}, 	// CAM_OUTPUT_1_OUTPUT_FORMAT_ORDER
+	{0xC8CE, 0x0014, 1}, 	// CAM_OUTPUT_1_JPEG_CONTROL
+	{0xD822, 0x4610, 1}, 	// JPEG_JPSS_CTRL_VAR
+	{0x3330, 0x0000, 1}, 	// OUTPUT_FORMAT_TEST
+	{0xA010, 0x00CC, 1}, 	// FD_MIN_EXPECTED50HZ_FLICKER_PERIOD
+	{0xA012, 0x00E0, 1}, 	// FD_MAX_EXPECTED50HZ_FLICKER_PERIOD
+	{0xA014, 0x00A8, 1}, 	// FD_MIN_EXPECTED60HZ_FLICKER_PERIOD
+	{0xA016, 0x00BC, 1}, 	// FD_MAX_EXPECTED60HZ_FLICKER_PERIOD
+	{0xA018, 0x00D6, 1}, 	// FD_EXPECTED50HZ_FLICKER_PERIOD_IN_CONTEXT_A
+	{0xA01A, 0x0095, 1}, 	// FD_EXPECTED50HZ_FLICKER_PERIOD_IN_CONTEXT_B
+	{0xA01C, 0x00B2, 1}, 	// FD_EXPECTED60HZ_FLICKER_PERIOD_IN_CONTEXT_A
+	{0xA01E, 0x007C, 1}, 	// FD_EXPECTED60HZ_FLICKER_PERIOD_IN_CONTEXT_B
+	{0x0982, 0x0000, 1}, 	// ACCESS_CTL_STAT
+	{0x098A, 0x0000, 1}, 	// PHYSICAL_ADDRESS_ACCESS
+};
+
+struct mt9p111_reg_cfg 	mt9p111_init1_2[]=
+{
+	{0x886C, 0xC0F1, 1},
+	{0x886E, 0xC5E1, 1},
+	{0x8870, 0x246A, 1},
+	{0x8872, 0x1280, 1},
+	{0x8874, 0xC4E1, 1},
+	{0x8876, 0xD30E, 1},
+	{0x8878, 0x2069, 1},
+	{0x887A, 0x0000, 1},
+	{0x887C, 0x1305, 1},
+	{0x887E, 0x0084, 1},
+	{0x8880, 0x1730, 1},
+	{0x8882, 0x7005, 1},
+	{0x8884, 0xD801, 1},
+	{0x8886, 0x8B41, 1},
+	{0x8888, 0xD900, 1},
+	{0x888A, 0x0D5E, 1},
+	{0x888C, 0x0664, 1},
+	{0x888E, 0x8B63, 1},
+	{0x8890, 0xE809, 1},
+	{0x8892, 0xD509, 1},
+	{0x8894, 0xF004, 1},
+	{0x8896, 0x1504, 1},
+	{0x8898, 0x1400, 1},
+	{0x889A, 0x7840, 1},
+	{0x889C, 0xD007, 1},
+	{0x889E, 0x0DFB, 1},
+	{0x88A0, 0x9004, 1},
+	{0x88A2, 0xC4C1, 1},
+	{0x88A4, 0x2029, 1},
+	{0x88A6, 0x0300, 1},
+	{0x88A8, 0x021D, 1},
+	{0x88AA, 0x06C4, 1},
+	{0x88AC, 0xFF80, 1},
+	{0x88AE, 0x08C8, 1},
+	{0x88B0, 0xFF80, 1},
+	{0x88B2, 0x086C, 1},
+	{0x88B4, 0xFF80, 1},
+	{0x88B6, 0x08BC, 1},
+	{0x88B8, 0xFF80, 1},
+	{0x88BA, 0x08C8, 1},
+	{0x88BC, 0xFF80, 1},
+	{0x88BE, 0x08D0, 1},
+	{0x88C0, 0xFF80, 1},
+	{0x88C2, 0x0978, 1},
+	{0x88C4, 0xFF80, 1},
+	{0x88C6, 0x0F88, 1},
+	{0x88C8, 0x0007, 1},
+	{0x88CA, 0x0006, 1},
+	{0x88CC, 0x0000, 1},
+	{0x88CE, 0x0000, 1},
+	{0x88D0, 0xC0F1, 1},
+	{0x88D2, 0x097E, 1},
+	{0x88D4, 0x06E4, 1},
+	{0x88D6, 0xDA14, 1},
+	{0x88D8, 0xD0DB, 1},
+	{0x88DA, 0xDE00, 1},
+	{0x88DC, 0xD1DB, 1},
+	{0x88DE, 0x2E41, 1},
+	{0x88E0, 0x120C, 1},
+	{0x88E2, 0xA895, 1},
+	{0x88E4, 0xD5DA, 1},
+	{0x88E6, 0xA8D4, 1},
+	{0x88E8, 0xA8D6, 1},
+	{0x88EA, 0x0F0A, 1},
+	{0x88EC, 0x06A4, 1},
+	{0x88EE, 0x2555, 1},
+	{0x88F0, 0x1440, 1},
+	{0x88F2, 0xD0D8, 1},
+	{0x88F4, 0x2555, 1},
+	{0x88F6, 0x1441, 1},
+	{0x88F8, 0x77A9, 1},
+	{0x88FA, 0xA515, 1},
+	{0x88FC, 0xD0D6, 1},
+	{0x88FE, 0xA020, 1},
+	{0x8900, 0xD1D6, 1},
+	{0x8902, 0x70E9, 1},
+	{0x8904, 0x0EEE, 1},
+	{0x8906, 0x06A4, 1},
+	{0x8908, 0xDA44, 1},
+	{0x890A, 0xD0D5, 1},
+	{0x890C, 0xD1D5, 1},
+	{0x890E, 0xDAF0, 1},
+	{0x8910, 0xDB08, 1},
+	{0x8912, 0xA502, 1},
+	{0x8914, 0xD0D4, 1},
+	{0x8916, 0x19B0, 1},
+	{0x8918, 0x00C2, 1},
+	{0x891A, 0x19B1, 1},
+	{0x891C, 0x0082, 1},
+	{0x891E, 0x19B4, 1},
+	{0x8920, 0x00C2, 1},
+	{0x8922, 0xA0E0, 1},
+	{0x8924, 0xD0D1, 1},
+	{0x8926, 0x19B5, 1},
+	{0x8928, 0x0082, 1},
+	{0x892A, 0xB0CB, 1},
+	{0x892C, 0x8900, 1},
+	{0x892E, 0xB8A6, 1},
+	{0x8930, 0xA900, 1},
+	{0x8932, 0xD851, 1},
+	{0x8934, 0x19B2, 1},
+	{0x8936, 0x0002, 1},
+	{0x8938, 0xD852, 1},
+	{0x893A, 0x19B3, 1},
+	{0x893C, 0x0002, 1},
+	{0x893E, 0xD855, 1},
+	{0x8940, 0x19B6, 1},
+	{0x8942, 0x0002, 1},
+	{0x8944, 0xD856, 1},
+	{0x8946, 0x19B7, 1},
+	{0x8948, 0x0002, 1},
+	{0x894A, 0xD896, 1},
+	{0x894C, 0x19B8, 1},
+	{0x894E, 0x0004, 1},
+	{0x8950, 0xD814, 1},
+	{0x8952, 0x19BA, 1},
+	{0x8954, 0x0004, 1},
+	{0x8956, 0xD805, 1},
+	{0x8958, 0xB111, 1},
+	{0x895A, 0xD1C5, 1},
+	{0x895C, 0x2556, 1},
+	{0x895E, 0x12C0, 1},
+	{0x8960, 0x0E92, 1},
+	{0x8962, 0x06A4, 1},
+	{0x8964, 0xDA2C, 1},
+	{0x8966, 0xD0C3, 1},
+	{0x8968, 0x2556, 1},
+	{0x896A, 0x12C1, 1},
+	{0x896C, 0xA519, 1},
+	{0x896E, 0xD0C2, 1},
+	{0x8970, 0x0145, 1},
+	{0x8972, 0x06E4, 1},
+	{0x8974, 0xA020, 1},
+	{0x8976, 0x78E0, 1},
+	{0x8978, 0xD0C0, 1},
+	{0x897A, 0xD1B5, 1},
+	{0x897C, 0x1984, 1},
+	{0x897E, 0x0000, 1},
+	{0x8980, 0xD0BF, 1},
+	{0x8982, 0x1988, 1},
+	{0x8984, 0x0000, 1},
+	{0x8986, 0xD0BF, 1},
+	{0x8988, 0x198C, 1},
+	{0x898A, 0x0000, 1},
+	{0x898C, 0xD0BE, 1},
+	{0x898E, 0x1990, 1},
+	{0x8990, 0x0000, 1},
+	{0x8992, 0xD0BE, 1},
+	{0x8994, 0x2180, 1},
+	{0x8996, 0x0102, 1},
+	{0x8998, 0x7FE0, 1},
+	{0x899A, 0xA020, 1},
+	{0x899C, 0xC0F1, 1},
+	{0x899E, 0x08B6, 1},
+	{0x89A0, 0x06E4, 1},
+	{0x89A2, 0xDB03, 1},
+	{0x89A4, 0xD2BA, 1},
+	{0x89A6, 0x8A2E, 1},
+	{0x89A8, 0x8ACF, 1},
+	{0x89AA, 0xB908, 1},
+	{0x89AC, 0x79C5, 1},
+	{0x89AE, 0xDD65, 1},
+	{0x89B0, 0x094F, 1},
+	{0x89B2, 0x00D1, 1},
+	{0x89B4, 0xD90A, 1},
+	{0x89B6, 0x1A24, 1},
+	{0x89B8, 0x0042, 1},
+	{0x89BA, 0x8A24, 1},
+	{0x89BC, 0xE1E5, 1},
+	{0x89BE, 0xF6C9, 1},
+	{0x89C0, 0xD902, 1},
+	{0x89C2, 0x2941, 1},
+	{0x89C4, 0x0200, 1},
+	{0x89C6, 0xAA0E, 1},
+	{0x89C8, 0xAA2F, 1},
+	{0x89CA, 0x70A9, 1},
+	{0x89CC, 0xF014, 1},
+	{0x89CE, 0xE1C8, 1},
+	{0x89D0, 0x0036, 1},
+	{0x89D2, 0x000B, 1},
+	{0x89D4, 0xE0C8, 1},
+	{0x89D6, 0x003A, 1},
+	{0x89D8, 0x000A, 1},
+	{0x89DA, 0xD901, 1},
+	{0x89DC, 0x2941, 1},
+	{0x89DE, 0x0200, 1},
+	{0x89E0, 0xAA0E, 1},
+	{0x89E2, 0xAA2F, 1},
+	{0x89E4, 0xD848, 1},
+	{0x89E6, 0xF008, 1},
+	{0x89E8, 0xD900, 1},
+	{0x89EA, 0x2941, 1},
+	{0x89EC, 0x0200, 1},
+	{0x89EE, 0xAA0E, 1},
+	{0x89F0, 0xAA2F, 1},
+	{0x89F2, 0xD820, 1},
+	{0x89F4, 0xD2A7, 1},
+	{0x89F6, 0x8A26, 1},
+	{0x89F8, 0xB961, 1},
+	{0x89FA, 0xAA26, 1},
+	{0x89FC, 0xF00D, 1},
+	{0x89FE, 0x091F, 1},
+	{0x8A00, 0x0091, 1},
+	{0x8A02, 0x8A24, 1},
+	{0x8A04, 0xF1E5, 1},
+	{0x8A06, 0x0913, 1},
+	{0x8A08, 0x0812, 1},
+	{0x8A0A, 0x08E1, 1},
+	{0x8A0C, 0x8812, 1},
+	{0x8A0E, 0x2B41, 1},
+	{0x8A10, 0x0201, 1},
+	{0x8A12, 0xAA2E, 1},
+	{0x8A14, 0xAA6F, 1},
+	{0x8A16, 0x00A9, 1},
+	{0x8A18, 0x06C4, 1},
+	{0x8A1A, 0x09F7, 1},
+	{0x8A1C, 0x8051, 1},
+	{0x8A1E, 0x8A24, 1},
+	{0x8A20, 0xF1F3, 1},
+	{0x8A22, 0x78E0, 1},
+	{0x8A24, 0xC0F1, 1},
+	{0x8A26, 0x0822, 1},
+	{0x8A28, 0x06C4, 1},
+	{0x8A2A, 0xD699, 1},
+	{0x8A2C, 0x7508, 1},
+	{0x8A2E, 0xD199, 1},
+	{0x8A30, 0x8E01, 1},
+	{0x8A32, 0x1146, 1},
+	{0x8A34, 0x0082, 1},
+	{0x8A36, 0x2046, 1},
+	{0x8A38, 0x00C0, 1},
+	{0x8A3A, 0xAE01, 1},
+	{0x8A3C, 0x1145, 1},
+	{0x8A3E, 0x0080, 1},
+	{0x8A40, 0xB808, 1},
+	{0x8A42, 0x7845, 1},
+	{0x8A44, 0x0817, 1},
+	{0x8A46, 0x001E, 1},
+	{0x8A48, 0x8900, 1},
+	{0x8A4A, 0x8941, 1},
+	{0x8A4C, 0xB808, 1},
+	{0x8A4E, 0x7845, 1},
+	{0x8A50, 0x080B, 1},
+	{0x8A52, 0x00DE, 1},
+	{0x8A54, 0x70A9, 1},
+	{0x8A56, 0xFFD2, 1},
+	{0x8A58, 0x7508, 1},
+	{0x8A5A, 0x1604, 1},
+	{0x8A5C, 0x1090, 1},
+	{0x8A5E, 0x0D93, 1},
+	{0x8A60, 0x1400, 1},
+	{0x8A62, 0x8EEA, 1},
+	{0x8A64, 0x8E0B, 1},
+	{0x8A66, 0x214A, 1},
+	{0x8A68, 0x2040, 1},
+	{0x8A6A, 0x8E2D, 1},
+	{0x8A6C, 0xBF08, 1},
+	{0x8A6E, 0x7F05, 1},
+	{0x8A70, 0x8E0C, 1},
+	{0x8A72, 0xB808, 1},
+	{0x8A74, 0x7825, 1},
+	{0x8A76, 0x7710, 1},
+	{0x8A78, 0x21C2, 1},
+	{0x8A7A, 0x244C, 1},
+	{0x8A7C, 0x081D, 1},
+	{0x8A7E, 0x03E3, 1},
+	{0x8A80, 0xD9FF, 1},
+	{0x8A82, 0x2702, 1},
+	{0x8A84, 0x1002, 1},
+	{0x8A86, 0x2A05, 1},
+	{0x8A88, 0x037E, 1},
+	{0x8A8A, 0x089E, 1},
+	{0x8A8C, 0x06E4, 1},
+	{0x8A8E, 0x702F, 1},
+	{0x8A90, 0x7810, 1},
+	{0x8A92, 0x7F02, 1},
+	{0x8A94, 0x7FF0, 1},
+	{0x8A96, 0xF00B, 1},
+	{0x8A98, 0x78E2, 1},
+	{0x8A9A, 0x2805, 1},
+	{0x8A9C, 0x037E, 1},
+	{0x8A9E, 0x088A, 1},
+	{0x8AA0, 0x06E4, 1},
+	{0x8AA2, 0x702F, 1},
+	{0x8AA4, 0x7810, 1},
+	{0x8AA6, 0x671F, 1},
+	{0x8AA8, 0x7FF0, 1},
+	{0x8AAA, 0x8E08, 1},
+	{0x8AAC, 0xD17A, 1},
+	{0x8AAE, 0x7FEF, 1},
+	{0x8AB0, 0xBF06, 1},
+	{0x8AB2, 0xB8C3, 1},
+	{0x8AB4, 0x78E5, 1},
+	{0x8AB6, 0xB88F, 1},
+	{0x8AB8, 0x1908, 1},
+	{0x8ABA, 0x0024, 1},
+	{0x8ABC, 0x2841, 1},
+	{0x8ABE, 0x0201, 1},
+	{0x8AC0, 0x1E26, 1},
+	{0x8AC2, 0x1042, 1},
+	{0x8AC4, 0x0D15, 1},
+	{0x8AC6, 0x1423, 1},
+	{0x8AC8, 0x1E27, 1},
+	{0x8ACA, 0x1002, 1},
+	{0x8ACC, 0x214C, 1},
+	{0x8ACE, 0xA000, 1},
+	{0x8AD0, 0x214A, 1},
+	{0x8AD2, 0x2040, 1},
+	{0x8AD4, 0x21C2, 1},
+	{0x8AD6, 0x2442, 1},
+	{0x8AD8, 0x8E21, 1},
+	{0x8ADA, 0x214F, 1},
+	{0x8ADC, 0x0040, 1},
+	{0x8ADE, 0x090F, 1},
+	{0x8AE0, 0x2010, 1},
+	{0x8AE2, 0x2145, 1},
+	{0x8AE4, 0x0181, 1},
+	{0x8AE6, 0xAE21, 1},
+	{0x8AE8, 0xF003, 1},
+	{0x8AEA, 0xB8A2, 1},
+	{0x8AEC, 0xAE01, 1},
+	{0x8AEE, 0x0C22, 1},
+	{0x8AF0, 0xFFE3, 1},
+	{0x8AF2, 0x70A9, 1},
+	{0x8AF4, 0x07B1, 1},
+	{0x8AF6, 0x0684, 1},
+	{0x8AF8, 0xC0F1, 1},
+	{0x8AFA, 0x0F5A, 1},
+	{0x8AFC, 0x0684, 1},
+	{0x8AFE, 0xD564, 1},
+	{0x8B00, 0x8D00, 1},
+	{0x8B02, 0x083D, 1},
+	{0x8B04, 0x01DE, 1},
+	{0x8B06, 0xB8A7, 1},
+	{0x8B08, 0x790F, 1},
+	{0x8B0A, 0xD660, 1},
+	{0x8B0C, 0xAD00, 1},
+	{0x8B0E, 0x091D, 1},
+	{0x8B10, 0x0050, 1},
+	{0x8B12, 0x091D, 1},
+	{0x8B14, 0x0110, 1},
+	{0x8B16, 0x0911, 1},
+	{0x8B18, 0x0210, 1},
+	{0x8B1A, 0xD060, 1},
+	{0x8B1C, 0x0B56, 1},
+	{0x8B1E, 0xFFE3, 1},
+	{0x8B20, 0xA600, 1},
+	{0x8B22, 0xF008, 1},
+	{0x8B24, 0xD05E, 1},
+	{0x8B26, 0xF005, 1},
+	{0x8B28, 0xD05E, 1},
+	{0x8B2A, 0xF003, 1},
+	{0x8B2C, 0xD05E, 1},
+	{0x8B2E, 0xA600, 1},
+	{0x8B30, 0x8600, 1},
+	{0x8B32, 0x8023, 1},
+	{0x8B34, 0x7960, 1},
+	{0x8B36, 0xD801, 1},
+	{0x8B38, 0xD800, 1},
+	{0x8B3A, 0xAD05, 1},
+	{0x8B3C, 0x1528, 1},
+	{0x8B3E, 0x1080, 1},
+	{0x8B40, 0x0817, 1},
+	{0x8B42, 0x01DE, 1},
+	{0x8B44, 0xB8A7, 1},
+	{0x8B46, 0x1D28, 1},
+	{0x8B48, 0x1002, 1},
+	{0x8B4A, 0xD050, 1},
+	{0x8B4C, 0x8000, 1},
+	{0x8B4E, 0x8023, 1},
+	{0x8B50, 0x7960, 1},
+	{0x8B52, 0x1528, 1},
+	{0x8B54, 0x1080, 1},
+	{0x8B56, 0x0769, 1},
+	{0x8B58, 0x0684, 1},
+	{0x8B5A, 0x78E0, 1},
+	{0x8B5C, 0xD24C, 1},
+	{0x8B5E, 0x8A21, 1},
+	{0x8B60, 0xB9A1, 1},
+	{0x8B62, 0x782F, 1},
+	{0x8B64, 0x7FE0, 1},
+	{0x8B66, 0xAA21, 1},
+	{0x8B68, 0xD150, 1},
+	{0x8B6A, 0xD251, 1},
+	{0x8B6C, 0x11B2, 1},
+	{0x8B6E, 0x8903, 1},
+	{0x8B70, 0x1252, 1},
+	{0x8B72, 0x0100, 1},
+	{0x8B74, 0x7B6F, 1},
+	{0x8B76, 0xB808, 1},
+	{0x8B78, 0x2004, 1},
+	{0x8B7A, 0x0F80, 1},
+	{0x8B7C, 0x0000, 1},
+	{0x8B7E, 0xFF00, 1},
+	{0x8B80, 0x7865, 1},
+	{0x8B82, 0x19B2, 1},
+	{0x8B84, 0x8024, 1},
+	{0x8B86, 0xD04B, 1},
+	{0x8B88, 0x8801, 1},
+	{0x8B8A, 0x2051, 1},
+	{0x8B8C, 0x8040, 1},
+	{0x8B8E, 0xD800, 1},
+	{0x8B90, 0xF403, 1},
+	{0x8B92, 0x1234, 1},
+	{0x8B94, 0x0080, 1},
+	{0x8B96, 0x1955, 1},
+	{0x8B98, 0x803C, 1},
+	{0x8B9A, 0x1233, 1},
+	{0x8B9C, 0x0080, 1},
+	{0x8B9E, 0xB802, 1},
+	{0x8BA0, 0x1957, 1},
+	{0x8BA2, 0x803C, 1},
+	{0x8BA4, 0x1958, 1},
+	{0x8BA6, 0x803C, 1},
+	{0x8BA8, 0x1959, 1},
+	{0x8BAA, 0x803C, 1},
+	{0x8BAC, 0x195A, 1},
+	{0x8BAE, 0x803C, 1},
+	{0x8BB0, 0x7EE0, 1},
+	{0x8BB2, 0x78E0, 1},
+	{0x8BB4, 0xC0F1, 1},
+	{0x8BB6, 0x0E9A, 1},
+	{0x8BB8, 0x0684, 1},
+	{0x8BBA, 0xD523, 1},
+	{0x8BBC, 0x8D2C, 1},
+	{0x8BBE, 0x0983, 1},
+	{0x8BC0, 0x0010, 1},
+	{0x8BC2, 0xD23C, 1},
+	{0x8BC4, 0x123A, 1},
+	{0x8BC6, 0x0083, 1},
+	{0x8BC8, 0x123B, 1},
+	{0x8BCA, 0x008F, 1},
+	{0x8BCC, 0x8D55, 1},
+	{0x8BCE, 0xBB08, 1},
+	{0x8BD0, 0x7BE5, 1},
+	{0x8BD2, 0x8DF6, 1},
+	{0x8BD4, 0xBA08, 1},
+	{0x8BD6, 0x7AE5, 1},
+	{0x8BD8, 0x0B0D, 1},
+	{0x8BDA, 0x00A3, 1},
+	{0x8BDC, 0x8DC5, 1},
+	{0x8BDE, 0x8D54, 1},
+	{0x8BE0, 0xAD45, 1},
+	{0x8BE2, 0xF026, 1},
+	{0x8BE4, 0x65DB, 1},
+	{0x8BE6, 0x8B6D, 1},
+	{0x8BE8, 0x0815, 1},
+	{0x8BEA, 0x00E2, 1},
+	{0x8BEC, 0x65DA, 1},
+	{0x8BEE, 0x8A51, 1},
+	{0x8BF0, 0x0A0D, 1},
+	{0x8BF2, 0x0002, 1},
+	{0x8BF4, 0xE683, 1},
+	{0x8BF6, 0x22CA, 1},
+	{0x8BF8, 0x038B, 1},
+	{0x8BFA, 0xF69A, 1},
+	{0x8BFC, 0xDA00, 1},
+	{0x8BFE, 0xAD45, 1},
+	{0x8C00, 0x2540, 1},
+	{0x8C02, 0x1343, 1},
+	{0x8C04, 0xE180, 1},
+	{0x8C06, 0x2540, 1},
+	{0x8C08, 0x144F, 1},
+	{0x8C0A, 0xF6D2, 1},
+	{0x8C0C, 0x719F, 1},
+	{0x8C0E, 0x78E0, 1},
+	{0x8C10, 0x20A8, 1},
+	{0x8C12, 0x0280, 1},
+	{0x8C14, 0x8B20, 1},
+	{0x8C16, 0x0813, 1},
+	{0x8C18, 0x0043, 1},
+	{0x8C1A, 0xE201, 1},
+	{0x8C1C, 0x7A4F, 1},
+	{0x8C1E, 0xAD45, 1},
+	{0x8C20, 0xE301, 1},
+	{0x8C22, 0xE701, 1},
+	{0x8C24, 0xF004, 1},
+	{0x8C26, 0x8F20, 1},
+	{0x8C28, 0x09F3, 1},
+	{0x8C2A, 0x8002, 1},
+	{0x8C2C, 0xD022, 1},
+	{0x8C2E, 0x8800, 1},
+	{0x8C30, 0xE803, 1},
+	{0x8C32, 0x0E0F, 1},
+	{0x8C34, 0x1080, 1},
+	{0x8C36, 0xD008, 1},
+	{0x8C38, 0x8000, 1},
+	{0x8C3A, 0x8002, 1},
+	{0x8C3C, 0x7840, 1},
+	{0x8C3E, 0x0679, 1},
+	{0x8C40, 0x0684, 1},
+	{0x8C42, 0x78E0, 1},
+	{0x8C44, 0xFF80, 1},
+	{0x8C46, 0x0644, 1},
+	{0x8C48, 0x0000, 1},
+	{0x8C4A, 0xF978, 1},
+	{0x8C4C, 0xFF80, 1},
+	{0x8C4E, 0x1030, 1},
+	{0x8C50, 0xFF80, 1},
+	{0x8C52, 0x0BB4, 1},
+	{0x8C54, 0x8000, 1},
+	{0x8C56, 0x0164, 1},
+	{0x8C58, 0x0000, 1},
+	{0x8C5A, 0xF9AC, 1},
+	{0x8C5C, 0xFF80, 1},
+	{0x8C5E, 0x0B68, 1},
+	{0x8C60, 0xFF80, 1},
+	{0x8C62, 0x0314, 1},
+	{0x8C64, 0x8000, 1},
+	{0x8C66, 0x016C, 1},
+	{0x8C68, 0xFF80, 1},
+	{0x8C6A, 0x0694, 1},
+	{0x8C6C, 0x0000, 1},
+	{0x8C6E, 0xF444, 1},
+	{0x8C70, 0xFF80, 1},
+	{0x8C72, 0x0CB8, 1},
+	{0x8C74, 0x8000, 1},
+	{0x8C76, 0x009C, 1},
+	{0x8C78, 0xFF80, 1},
+	{0x8C7A, 0x0AF8, 1},
+	{0x8C7C, 0xFF80, 1},
+	{0x8C7E, 0x0A24, 1},
+	{0x8C80, 0xFF80, 1},
+	{0x8C82, 0x0B5C, 1},
+	{0x8C84, 0x0000, 1},
+	{0x8C86, 0x0998, 1},
+	{0x8C88, 0x8000, 1},
+	{0x8C8A, 0x0008, 1},
+	{0x8C8C, 0xFF80, 1},
+	{0x8C8E, 0x0158, 1},
+	{0x8C90, 0xFF80, 1},
+	{0x8C92, 0x0290, 1},
+	{0x8C94, 0xFF00, 1},
+	{0x8C96, 0x0618, 1},
+	{0x8C98, 0x0000, 1},
+	{0x8C9A, 0xF1A4, 1},
+	{0x8C9C, 0xFF80, 1},
+	{0x8C9E, 0x10B4, 1},
+	{0x8CA0, 0x0000, 1},
+	{0x8CA2, 0xF1B4, 1},
+	{0x8CA4, 0x0000, 1},
+	{0x8CA6, 0xF1C4, 1},
+	{0x8CA8, 0xFF00, 1},
+	{0x8CAA, 0x33CC, 1},
+	{0x8CAC, 0xFF80, 1},
+	{0x8CAE, 0x0658, 1},
+	{0x8CB0, 0xFF80, 1},
+	{0x8CB2, 0x0250, 1},
+	{0x8CB4, 0x8000, 1},
+	{0x8CB6, 0x0168, 1},
+	{0x8CB8, 0xC0F1, 1},
+	{0x8CBA, 0x0D9A, 1},
+	{0x8CBC, 0x0684, 1},
+	{0x8CBE, 0x17A4, 1},
+	{0x8CC0, 0xF00E, 1},
+	{0x8CC2, 0x8E01, 1},
+	{0x8CC4, 0xB8A4, 1},
+	{0x8CC6, 0xAE01, 1},
+	{0x8CC8, 0x8E09, 1},
+	{0x8CCA, 0x2051, 1},
+	{0x8CCC, 0x8000, 1},
+	{0x8CCE, 0xF29C, 1},
+	{0x8CD0, 0x17E0, 1},
+	{0x8CD2, 0xF00D, 1},
+	{0x8CD4, 0x153A, 1},
+	{0x8CD6, 0x1080, 1},
+	{0x8CD8, 0x153B, 1},
+	{0x8CDA, 0x1081, 1},
+	{0x8CDC, 0xB808, 1},
+	{0x8CDE, 0x7825, 1},
+	{0x8CE0, 0x16B8, 1},
+	{0x8CE2, 0x1101, 1},
+	{0x8CE4, 0x092B, 1},
+	{0x8CE6, 0x0003, 1},
+	{0x8CE8, 0x16B0, 1},
+	{0x8CEA, 0x1082, 1},
+	{0x8CEC, 0x1E3C, 1},
+	{0x8CEE, 0x1082, 1},
+	{0x8CF0, 0x16B1, 1},
+	{0x8CF2, 0x1082, 1},
+	{0x8CF4, 0x1E3D, 1},
+	{0x8CF6, 0x1082, 1},
+	{0x8CF8, 0x16B4, 1},
+	{0x8CFA, 0x1082, 1},
+	{0x8CFC, 0x1E3E, 1},
+	{0x8CFE, 0x1082, 1},
+	{0x8D00, 0x16B5, 1},
+	{0x8D02, 0x1082, 1},
+	{0x8D04, 0x1E3F, 1},
+	{0x8D06, 0x1082, 1},
+	{0x8D08, 0x8E40, 1},
+	{0x8D0A, 0xBAA6, 1},
+	{0x8D0C, 0xAE40, 1},
+	{0x8D0E, 0x0991, 1},
+	{0x8D10, 0x0022, 1},
+	{0x8D12, 0x16BA, 1},
+	{0x8D14, 0x1102, 1},
+	{0x8D16, 0x0A89, 1},
+	{0x8D18, 0x0003, 1},
+	{0x8D1A, 0x16B2, 1},
+	{0x8D1C, 0x1084, 1},
+	{0x8D1E, 0x0ECA, 1},
+	{0x8D20, 0x0664, 1},
+	{0x8D22, 0x16B0, 1},
+	{0x8D24, 0x1083, 1},
+	{0x8D26, 0x1E3C, 1},
+	{0x8D28, 0x1002, 1},
+	{0x8D2A, 0x153A, 1},
+	{0x8D2C, 0x1080, 1},
+	{0x8D2E, 0x153B, 1},
+	{0x8D30, 0x1081, 1},
+	{0x8D32, 0x16B3, 1},
+	{0x8D34, 0x1084, 1},
+	{0x8D36, 0xB808, 1},
+	{0x8D38, 0x7825, 1},
+	{0x8D3A, 0x16B8, 1},
+	{0x8D3C, 0x1101, 1},
+	{0x8D3E, 0x16BA, 1},
+	{0x8D40, 0x1102, 1},
+	{0x8D42, 0x0EA6, 1},
+	{0x8D44, 0x0664, 1},
+	{0x8D46, 0x16B1, 1},
+	{0x8D48, 0x1083, 1},
+	{0x8D4A, 0x1E3D, 1},
+	{0x8D4C, 0x1002, 1},
+	{0x8D4E, 0x153A, 1},
+	{0x8D50, 0x1080, 1},
+	{0x8D52, 0x153B, 1},
+	{0x8D54, 0x1081, 1},
+	{0x8D56, 0x16B6, 1},
+	{0x8D58, 0x1084, 1},
+	{0x8D5A, 0xB808, 1},
+	{0x8D5C, 0x7825, 1},
+	{0x8D5E, 0x16B8, 1},
+	{0x8D60, 0x1101, 1},
+	{0x8D62, 0x16BA, 1},
+	{0x8D64, 0x1102, 1},
+	{0x8D66, 0x0E82, 1},
+	{0x8D68, 0x0664, 1},
+	{0x8D6A, 0x16B4, 1},
+	{0x8D6C, 0x1083, 1},
+	{0x8D6E, 0x1E3E, 1},
+	{0x8D70, 0x1002, 1},
+	{0x8D72, 0x153A, 1},
+	{0x8D74, 0x1080, 1},
+	{0x8D76, 0x153B, 1},
+	{0x8D78, 0x1081, 1},
+	{0x8D7A, 0x16B7, 1},
+	{0x8D7C, 0x1084, 1},
+	{0x8D7E, 0xB808, 1},
+	{0x8D80, 0x7825, 1},
+	{0x8D82, 0x16B8, 1},
+	{0x8D84, 0x1101, 1},
+	{0x8D86, 0x16BA, 1},
+	{0x8D88, 0x1102, 1},
+	{0x8D8A, 0x0E5E, 1},
+	{0x8D8C, 0x0664, 1},
+	{0x8D8E, 0x16B5, 1},
+	{0x8D90, 0x1083, 1},
+	{0x8D92, 0x1E3F, 1},
+	{0x8D94, 0x1002, 1},
+	{0x8D96, 0x8E00, 1},
+	{0x8D98, 0xB8A6, 1},
+	{0x8D9A, 0xAE00, 1},
+	{0x8D9C, 0x153A, 1},
+	{0x8D9E, 0x1081, 1},
+	{0x8DA0, 0x153B, 1},
+	{0x8DA2, 0x1080, 1},
+	{0x8DA4, 0xB908, 1},
+	{0x8DA6, 0x7905, 1},
+	{0x8DA8, 0x16BA, 1},
+	{0x8DAA, 0x1100, 1},
+	{0x8DAC, 0x0859, 1},
+	{0x8DAE, 0x0042, 1},
+	{0x8DB0, 0xD017, 1},
+	{0x8DB2, 0x9E31, 1},
+	{0x8DB4, 0x904D, 1},
+	{0x8DB6, 0x0A2D, 1},
+	{0x8DB8, 0x0063, 1},
+	{0x8DBA, 0x8E00, 1},
+	{0x8DBC, 0x16B0, 1},
+	{0x8DBE, 0x1081, 1},
+	{0x8DC0, 0x1E3C, 1},
+	{0x8DC2, 0x1042, 1},
+	{0x8DC4, 0x16B1, 1},
+	{0x8DC6, 0x1081, 1},
+	{0x8DC8, 0x1E3D, 1},
+	{0x8DCA, 0x1042, 1},
+	{0x8DCC, 0x16B4, 1},
+	{0x8DCE, 0x1081, 1},
+	{0x8DD0, 0x1E3E, 1},
+	{0x8DD2, 0x1042, 1},
+	{0x8DD4, 0x16B5, 1},
+	{0x8DD6, 0x1081, 1},
+	{0x8DD8, 0x1E3F, 1},
+	{0x8DDA, 0x1042, 1},
+	{0x8DDC, 0xB886, 1},
+	{0x8DDE, 0xF013, 1},
+	{0x8DE0, 0x16B2, 1},
+	{0x8DE2, 0x1081, 1},
+	{0x8DE4, 0xB8A6, 1},
+	{0x8DE6, 0x1E3C, 1},
+	{0x8DE8, 0x1042, 1},
+	{0x8DEA, 0x16B3, 1},
+	{0x8DEC, 0x1081, 1},
+	{0x8DEE, 0x1E3D, 1},
+	{0x8DF0, 0x1042, 1},
+	{0x8DF2, 0x16B6, 1},
+	{0x8DF4, 0x1081, 1},
+	{0x8DF6, 0x1E3E, 1},
+	{0x8DF8, 0x1042, 1},
+	{0x8DFA, 0x16B7, 1},
+	{0x8DFC, 0x1081, 1},
+	{0x8DFE, 0x1E3F, 1},
+	{0x8E00, 0x1042, 1},
+	{0x8E02, 0xAE00, 1},
+	{0x8E04, 0x0D2A, 1},
+	{0x8E06, 0x0184, 1},
+	{0x8E08, 0x04B5, 1},
+	{0x8E0A, 0x0684, 1},
+	{0x8E0C, 0xFF80, 1},
+	{0x8E0E, 0x050C, 1},
+	{0x8E10, 0xC0F1, 1},
+	{0x8E12, 0x0BAA, 1},
+	{0x8E14, 0x0224, 1},
+	{0x8E16, 0xC5E1, 1},
+	{0x8E18, 0xD067, 1},
+	{0x8E1A, 0x8000, 1},
+	{0x8E1C, 0x880A, 1},
+	{0x8E1E, 0x085B, 1},
+	{0x8E20, 0x019F, 1},
+	{0x8E22, 0xD166, 1},
+	{0x8E24, 0xD800, 1},
+	{0x8E26, 0xA90F, 1},
+	{0x8E28, 0xD165, 1},
+	{0x8E2A, 0x81A1, 1},
+	{0x8E2C, 0x8160, 1},
+	{0x8E2E, 0xD165, 1},
+	{0x8E30, 0x2D41, 1},
+	{0x8E32, 0x1602, 1},
+	{0x8E34, 0x2B41, 1},
+	{0x8E36, 0x060C, 1},
+	{0x8E38, 0x1934, 1},
+	{0x8E3A, 0x0082, 1},
+	{0x8E3C, 0x1930, 1},
+	{0x8E3E, 0x0302, 1},
+	{0x8E40, 0x2D41, 1},
+	{0x8E42, 0x1402, 1},
+	{0x8E44, 0x2B41, 1},
+	{0x8E46, 0x040C, 1},
+	{0x8E48, 0x1935, 1},
+	{0x8E4A, 0x0082, 1},
+	{0x8E4C, 0x1931, 1},
+	{0x8E4E, 0x0302, 1},
+	{0x8E50, 0x2D41, 1},
+	{0x8E52, 0x1202, 1},
+	{0x8E54, 0x2B41, 1},
+	{0x8E56, 0x020C, 1},
+	{0x8E58, 0x1936, 1},
+	{0x8E5A, 0x0082, 1},
+	{0x8E5C, 0x1932, 1},
+	{0x8E5E, 0x0302, 1},
+	{0x8E60, 0x1937, 1},
+	{0x8E62, 0x0342, 1},
+	{0x8E64, 0x1933, 1},
+	{0x8E66, 0x00C2, 1},
+	{0x8E68, 0xD157, 1},
+	{0x8E6A, 0x8120, 1},
+	{0x8E6C, 0x7208, 1},
+	{0x8E6E, 0x81A8, 1},
+	{0x8E70, 0x7108, 1},
+	{0x8E72, 0x7D60, 1},
+	{0x8E74, 0x7308, 1},
+	{0x8E76, 0x0451, 1},
+	{0x8E78, 0x0684, 1},
+	{0x8E7A, 0x78E0, 1},
+	{0x8E7C, 0xC0F1, 1},
+	{0x8E7E, 0x0AE2, 1},
+	{0x8E80, 0x0224, 1},
+	{0x8E82, 0xC5E1, 1},
+	{0x8E84, 0xD14D, 1},
+	{0x8E86, 0x894D, 1},
+	{0x8E88, 0x0A63, 1},
+	{0x8E8A, 0x0002, 1},
+	{0x8E8C, 0xD04A, 1},
+	{0x8E8E, 0x8040, 1},
+	{0x8E90, 0x8A0B, 1},
+	{0x8E92, 0xB8A6, 1},
+	{0x8E94, 0xAA0B, 1},
+	{0x8E96, 0xD800, 1},
+	{0x8E98, 0xA90F, 1},
+	{0x8E9A, 0xD149, 1},
+	{0x8E9C, 0x8161, 1},
+	{0x8E9E, 0x81A0, 1},
+	{0x8EA0, 0xD148, 1},
+	{0x8EA2, 0x2B41, 1},
+	{0x8EA4, 0x0602, 1},
+	{0x8EA6, 0x2D41, 1},
+	{0x8EA8, 0x160C, 1},
+	{0x8EAA, 0x1934, 1},
+	{0x8EAC, 0x0082, 1},
+	{0x8EAE, 0x1930, 1},
+	{0x8EB0, 0x0302, 1},
+	{0x8EB2, 0x2B41, 1},
+	{0x8EB4, 0x0402, 1},
+	{0x8EB6, 0x2D41, 1},
+	{0x8EB8, 0x140C, 1},
+	{0x8EBA, 0x1935, 1},
+	{0x8EBC, 0x0082, 1},
+	{0x8EBE, 0x1931, 1},
+	{0x8EC0, 0x0302, 1},
+	{0x8EC2, 0x2B41, 1},
+	{0x8EC4, 0x0202, 1},
+	{0x8EC6, 0x2D41, 1},
+	{0x8EC8, 0x120C, 1},
+	{0x8ECA, 0x1936, 1},
+	{0x8ECC, 0x0082, 1},
+	{0x8ECE, 0x1932, 1},
+	{0x8ED0, 0x0302, 1},
+	{0x8ED2, 0x1937, 1},
+	{0x8ED4, 0x00C2, 1},
+	{0x8ED6, 0x1933, 1},
+	{0x8ED8, 0x0342, 1},
+	{0x8EDA, 0xD13B, 1},
+	{0x8EDC, 0x8120, 1},
+	{0x8EDE, 0x7208, 1},
+	{0x8EE0, 0x81A8, 1},
+	{0x8EE2, 0x7108, 1},
+	{0x8EE4, 0x7D60, 1},
+	{0x8EE6, 0x7308, 1},
+	{0x8EE8, 0xF003, 1},
+	{0x8EEA, 0x0D62, 1},
+	{0x8EEC, 0x0204, 1},
+	{0x8EEE, 0x03D9, 1},
+	{0x8EF0, 0x0684, 1},
+	{0x8EF2, 0x78E0, 1},
+	{0x8EF4, 0xC0F1, 1},
+	{0x8EF6, 0x0B52, 1},
+	{0x8EF8, 0x0684, 1},
+	{0x8EFA, 0xD532, 1},
+	{0x8EFC, 0xD733, 1},
+	{0x8EFE, 0x153A, 1},
+	{0x8F00, 0x1080, 1},
+	{0x8F02, 0x153B, 1},
+	{0x8F04, 0x1081, 1},
+	{0x8F06, 0x1528, 1},
+	{0x8F08, 0x108E, 1},
+	{0x8F0A, 0xB808, 1},
+	{0x8F0C, 0x7825, 1},
+	{0x8F0E, 0x703A, 1},
+	{0x8F10, 0x152A, 1},
+	{0x8F12, 0x1080, 1},
+	{0x8F14, 0x152B, 1},
+	{0x8F16, 0x1081, 1},
+	{0x8F18, 0xBE08, 1},
+	{0x8F1A, 0xB808, 1},
+	{0x8F1C, 0x7825, 1},
+	{0x8F1E, 0x701A, 1},
+	{0x8F20, 0x1529, 1},
+	{0x8F22, 0x1080, 1},
+	{0x8F24, 0x7E05, 1},
+	{0x8F26, 0x8700, 1},
+	{0x8F28, 0x800C, 1},
+	{0x8F2A, 0x7840, 1},
+	{0x8F2C, 0xD028, 1},
+	{0x8F2E, 0x153B, 1},
+	{0x8F30, 0x1082, 1},
+	{0x8F32, 0x9039, 1},
+	{0x8F34, 0x153A, 1},
+	{0x8F36, 0x1080, 1},
+	{0x8F38, 0xB808, 1},
+	{0x8F3A, 0x7845, 1},
+	{0x8F3C, 0x7822, 1},
+	{0x8F3E, 0xD11E, 1},
+	{0x8F40, 0x8120, 1},
+	{0x8F42, 0x912D, 1},
+	{0x8F44, 0x082F, 1},
+	{0x8F46, 0x0043, 1},
+	{0x8F48, 0x2941, 1},
+	{0x8F4A, 0x2201, 1},
+	{0x8F4C, 0x2E41, 1},
+	{0x8F4E, 0x1200, 1},
+	{0x8F50, 0x1D3A, 1},
+	{0x8F52, 0x1042, 1},
+	{0x8F54, 0x1D28, 1},
+	{0x8F56, 0x1002, 1},
+	{0x8F58, 0x8700, 1},
+	{0x8F5A, 0x2841, 1},
+	{0x8F5C, 0x2201, 1},
+	{0x8F5E, 0x1D3B, 1},
+	{0x8F60, 0x1442, 1},
+	{0x8F62, 0x1D2A, 1},
+	{0x8F64, 0x1042, 1},
+	{0x8F66, 0x800D, 1},
+	{0x8F68, 0x1D2B, 1},
+	{0x8F6A, 0x1402, 1},
+	{0x8F6C, 0x7860, 1},
+	{0x8F6E, 0x1D29, 1},
+	{0x8F70, 0x1382, 1},
+	{0x8F72, 0x0335, 1},
+	{0x8F74, 0x0684, 1},
+	{0x8F76, 0x78E0, 1},
+	{0x8F78, 0xC0F1, 1},
+	{0x8F7A, 0x0B6A, 1},
+	{0x8F7C, 0x01C4, 1},
+	{0x8F7E, 0xD215, 1},
+	{0x8F80, 0xD112, 1},
+	{0x8F82, 0xA140, 1},
+	{0x8F84, 0xC0D1, 1},
+	{0x8F86, 0x7EE0, 1},
+	{0x8F88, 0xC0F1, 1},
+	{0x8F8A, 0x0ACA, 1},
+	{0x8F8C, 0x06A4, 1},
+	{0x8F8E, 0xDA44, 1},
+	{0x8F90, 0xD111, 1},
+	{0x8F92, 0xD512, 1},
+	{0x8F94, 0x76A9, 1},
+	{0x8F96, 0x085E, 1},
+	{0x8F98, 0x06A4, 1},
+	{0x8F9A, 0x70C9, 1},
+	{0x8F9C, 0xD010, 1},
+	{0x8F9E, 0xA50D, 1},
+	{0x8FA0, 0xD010, 1},
+	{0x8FA2, 0xA50C, 1},
+	{0x8FA4, 0xD010, 1},
+	{0x8FA6, 0xA510, 1},
+	{0x8FA8, 0xD010, 1},
+	{0x8FAA, 0xA500, 1},
+	{0x8FAC, 0xD007, 1},
+	{0x8FAE, 0x0311, 1},
+	{0x8FB0, 0x06A4, 1},
+	{0x8FB2, 0xA0C0, 1},
+	{0x8FB4, 0x8000, 1},
+	{0x8FB6, 0x000C, 1},
+	{0x8FB8, 0xFF80, 1},
+	{0x8FBA, 0x040C, 1},
+	{0x8FBC, 0x8000, 1},
+	{0x8FBE, 0x00A8, 1},
+	{0x8FC0, 0xFF80, 1},
+	{0x8FC2, 0x0250, 1},
+	{0x8FC4, 0x8000, 1},
+	{0x8FC6, 0x0038, 1},
+	{0x8FC8, 0x8000, 1},
+	{0x8FCA, 0x00A4, 1},
+	{0x8FCC, 0xFF80, 1},
+	{0x8FCE, 0x0740, 1},
+	{0x8FD0, 0xFF80, 1},
+	{0x8FD2, 0x10C4, 1},
+	{0x8FD4, 0x0000, 1},
+	{0x8FD6, 0xF4BC, 1},
+	{0x8FD8, 0xFF80, 1},
+	{0x8FDA, 0x10C4, 1},
+	{0x8FDC, 0xFF80, 1},
+	{0x8FDE, 0x0E7C, 1},
+	{0x8FE0, 0xFF80, 1},
+	{0x8FE2, 0x0E10, 1},
+	{0x8FE4, 0xFF80, 1},
+	{0x8FE6, 0x0EF4, 1},
+	{0x8FE8, 0xFF80, 1},
+	{0x8FEA, 0x0F78, 1},
+	{0x8FEC, 0xEA0A, 1},
+	{0x8FEE, 0x242F, 1},
+	{0x8FF0, 0x7089, 1},
+	{0x8FF2, 0x78E0, 1},
+	{0x8FF4, 0x20A8, 1},
+	{0x8FF6, 0x0180, 1},
+	{0x8FF8, 0x1002, 1},
+	{0x8FFA, 0x0D02, 1},
+	{0x8FFC, 0x1902, 1},
+	{0x8FFE, 0x0094, 1},
+	{0x9000, 0x7FE0, 1},
+	{0x9002, 0x7028, 1},
+	{0x9004, 0x7308, 1},
+	{0x9006, 0x1000, 1},
+	{0x9008, 0x0900, 1},
+	{0x900A, 0x7904, 1},
+	{0x900C, 0x7947, 1},
+	{0x900E, 0x1B00, 1},
+	{0x9010, 0x0064, 1},
+	{0x9012, 0x7EE0, 1},
+	{0x9014, 0xEA0A, 1},
+	{0x9016, 0x242F, 1},
+	{0x9018, 0x7089, 1},
+	{0x901A, 0x78E0, 1},
+	{0x901C, 0x20A8, 1},
+	{0x901E, 0x0180, 1},
+	{0x9020, 0x1102, 1},
+	{0x9022, 0x0502, 1},
+	{0x9024, 0x1802, 1},
+	{0x9026, 0x00B4, 1},
+	{0x9028, 0x7FE0, 1},
+	{0x902A, 0x7028, 1},
+};
+
+//changed by liujianhua prepare for burst mode 
+struct mt9p111_reg_cfg_burst mt9p111_init1_2_burst[] = 
+{
+	{0x886C, {0xC0F1, 0xC5E1, 0x246A, 0x1280, 0xC4E1, 0xD30E, 0x2069, 0x0000},8},
+	{0x887C, {0x1305, 0x0084, 0x1730, 0x7005, 0xD801, 0x8B41, 0xD900, 0x0D5E},8},
+	{0x888C, {0x0664, 0x8B63, 0xE809, 0xD509, 0xF004, 0x1504, 0x1400, 0x7840},8},
+	{0x889C, {0xD007, 0x0DFB, 0x9004, 0xC4C1, 0x2029, 0x0300, 0x021D, 0x06C4},8},
+	{0x88AC, {0xFF80, 0x08C8, 0xFF80, 0x086C, 0xFF80, 0x08BC, 0xFF80, 0x08C8},8},
+	{0x88BC, {0xFF80, 0x08D0, 0xFF80, 0x0978, 0xFF80, 0x0F88, 0x0007, 0x0006},8},
+	{0x88CC, {0x0000, 0x0000, 0xC0F1, 0x097E, 0x06E4, 0xDA14, 0xD0DB, 0xDE00},8},
+	{0x88DC, {0xD1DB, 0x2E41, 0x120C, 0xA895, 0xD5DA, 0xA8D4, 0xA8D6, 0x0F0A},8},
+	{0x88EC, {0x06A4, 0x2555, 0x1440, 0xD0D8, 0x2555, 0x1441, 0x77A9, 0xA515},8},
+	{0x88FC, {0xD0D6, 0xA020, 0xD1D6, 0x70E9, 0x0EEE, 0x06A4, 0xDA44, 0xD0D5},8},
+	{0x890C, {0xD1D5, 0xDAF0, 0xDB08, 0xA502, 0xD0D4, 0x19B0, 0x00C2, 0x19B1},8},
+	{0x891C, {0x0082, 0x19B4, 0x00C2, 0xA0E0, 0xD0D1, 0x19B5, 0x0082, 0xB0CB},8},
+	{0x892C, {0x8900, 0xB8A6, 0xA900, 0xD851, 0x19B2, 0x0002, 0xD852, 0x19B3},8},
+	{0x893C, {0x0002, 0xD855, 0x19B6, 0x0002, 0xD856, 0x19B7, 0x0002, 0xD896},8},
+	{0x894C, {0x19B8, 0x0004, 0xD814, 0x19BA, 0x0004, 0xD805, 0xB111, 0xD1C5},8},
+	{0x895C, {0x2556, 0x12C0, 0x0E92, 0x06A4, 0xDA2C, 0xD0C3, 0x2556, 0x12C1},8},
+	{0x896C, {0xA519, 0xD0C2, 0x0145, 0x06E4, 0xA020, 0x78E0, 0xD0C0, 0xD1B5},8},
+	{0x897C, {0x1984, 0x0000, 0xD0BF, 0x1988, 0x0000, 0xD0BF, 0x198C, 0x0000},8},
+	{0x898C, {0xD0BE, 0x1990, 0x0000, 0xD0BE, 0x2180, 0x0102, 0x7FE0, 0xA020},8},
+	{0x899C, {0xC0F1, 0x08B6, 0x06E4, 0xDB03, 0xD2BA, 0x8A2E, 0x8ACF, 0xB908},8},
+	{0x89AC, {0x79C5, 0xDD65, 0x094F, 0x00D1, 0xD90A, 0x1A24, 0x0042, 0x8A24},8},
+	{0x89BC, {0xE1E5, 0xF6C9, 0xD902, 0x2941, 0x0200, 0xAA0E, 0xAA2F, 0x70A9},8},
+	{0x89CC, {0xF014, 0xE1C8, 0x0036, 0x000B, 0xE0C8, 0x003A, 0x000A, 0xD901},8},
+	{0x89DC, {0x2941, 0x0200, 0xAA0E, 0xAA2F, 0xD848, 0xF008, 0xD900, 0x2941},8},
+	{0x89EC, {0x0200, 0xAA0E, 0xAA2F, 0xD820, 0xD2A7, 0x8A26, 0xB961, 0xAA26},8},
+	{0x89FC, {0xF00D, 0x091F, 0x0091, 0x8A24, 0xF1E5, 0x0913, 0x0812, 0x08E1},8},
+	{0x8A0C, {0x8812, 0x2B41, 0x0201, 0xAA2E, 0xAA6F, 0x00A9, 0x06C4, 0x09F7},8},
+	{0x8A1C, {0x8051, 0x8A24, 0xF1F3, 0x78E0, 0xC0F1, 0x0822, 0x06C4, 0xD699},8},
+	{0x8A2C, {0x7508, 0xD199, 0x8E01, 0x1146, 0x0082, 0x2046, 0x00C0, 0xAE01},8},
+	{0x8A3C, {0x1145, 0x0080, 0xB808, 0x7845, 0x0817, 0x001E, 0x8900, 0x8941},8},
+	{0x8A4C, {0xB808, 0x7845, 0x080B, 0x00DE, 0x70A9, 0xFFD2, 0x7508, 0x1604},8},
+	{0x8A5C, {0x1090, 0x0D93, 0x1400, 0x8EEA, 0x8E0B, 0x214A, 0x2040, 0x8E2D},8},
+	{0x8A6C, {0xBF08, 0x7F05, 0x8E0C, 0xB808, 0x7825, 0x7710, 0x21C2, 0x244C},8},
+	{0x8A7C, {0x081D, 0x03E3, 0xD9FF, 0x2702, 0x1002, 0x2A05, 0x037E, 0x089E},8},
+	{0x8A8C, {0x06E4, 0x702F, 0x7810, 0x7F02, 0x7FF0, 0xF00B, 0x78E2, 0x2805},8},
+	{0x8A9C, {0x037E, 0x088A, 0x06E4, 0x702F, 0x7810, 0x671F, 0x7FF0, 0x8E08},8},
+	{0x8AAC, {0xD17A, 0x7FEF, 0xBF06, 0xB8C3, 0x78E5, 0xB88F, 0x1908, 0x0024},8},
+	{0x8ABC, {0x2841, 0x0201, 0x1E26, 0x1042, 0x0D15, 0x1423, 0x1E27, 0x1002},8},
+	{0x8ACC, {0x214C, 0xA000, 0x214A, 0x2040, 0x21C2, 0x2442, 0x8E21, 0x214F},8},
+	{0x8ADC, {0x0040, 0x090F, 0x2010, 0x2145, 0x0181, 0xAE21, 0xF003, 0xB8A2},8},
+	{0x8AEC, {0xAE01, 0x0C22, 0xFFE3, 0x70A9, 0x07B1, 0x0684, 0xC0F1, 0x0F5A},8},
+	{0x8AFC, {0x0684, 0xD564, 0x8D00, 0x083D, 0x01DE, 0xB8A7, 0x790F, 0xD660},8},
+	{0x8B0C, {0xAD00, 0x091D, 0x0050, 0x091D, 0x0110, 0x0911, 0x0210, 0xD060},8},
+	{0x8B1C, {0x0B56, 0xFFE3, 0xA600, 0xF008, 0xD05E, 0xF005, 0xD05E, 0xF003},8},
+	{0x8B2C, {0xD05E, 0xA600, 0x8600, 0x8023, 0x7960, 0xD801, 0xD800, 0xAD05},8},
+	{0x8B3C, {0x1528, 0x1080, 0x0817, 0x01DE, 0xB8A7, 0x1D28, 0x1002, 0xD050},8},
+	{0x8B4C, {0x8000, 0x8023, 0x7960, 0x1528, 0x1080, 0x0769, 0x0684, 0x78E0},8},
+	{0x8B5C, {0xD24C, 0x8A21, 0xB9A1, 0x782F, 0x7FE0, 0xAA21, 0xD150, 0xD251},8},
+	{0x8B6C, {0x11B2, 0x8903, 0x1252, 0x0100, 0x7B6F, 0xB808, 0x2004, 0x0F80},8},
+	{0x8B7C, {0x0000, 0xFF00, 0x7865, 0x19B2, 0x8024, 0xD04B, 0x8801, 0x2051},8},
+	{0x8B8C, {0x8040, 0xD800, 0xF403, 0x1234, 0x0080, 0x1955, 0x803C, 0x1233},8},
+	{0x8B9C, {0x0080, 0xB802, 0x1957, 0x803C, 0x1958, 0x803C, 0x1959, 0x803C},8},
+	{0x8BAC, {0x195A, 0x803C, 0x7EE0, 0x78E0, 0xC0F1, 0x0E9A, 0x0684, 0xD523},8},
+	{0x8BBC, {0x8D2C, 0x0983, 0x0010, 0xD23C, 0x123A, 0x0083, 0x123B, 0x008F},8},
+	{0x8BCC, {0x8D55, 0xBB08, 0x7BE5, 0x8DF6, 0xBA08, 0x7AE5, 0x0B0D, 0x00A3},8},
+	{0x8BDC, {0x8DC5, 0x8D54, 0xAD45, 0xF026, 0x65DB, 0x8B6D, 0x0815, 0x00E2},8},
+	{0x8BEC, {0x65DA, 0x8A51, 0x0A0D, 0x0002, 0xE683, 0x22CA, 0x038B, 0xF69A},8},
+	{0x8BFC, {0xDA00, 0xAD45, 0x2540, 0x1343, 0xE180, 0x2540, 0x144F, 0xF6D2},8},
+	{0x8C0C, {0x719F, 0x78E0, 0x20A8, 0x0280, 0x8B20, 0x0813, 0x0043, 0xE201},8},
+	{0x8C1C, {0x7A4F, 0xAD45, 0xE301, 0xE701, 0xF004, 0x8F20, 0x09F3, 0x8002},8},
+	{0x8C2C, {0xD022, 0x8800, 0xE803, 0x0E0F, 0x1080, 0xD008, 0x8000, 0x8002},8},
+	{0x8C3C, {0x7840, 0x0679, 0x0684, 0x78E0, 0xFF80, 0x0644, 0x0000, 0xF978},8},
+	{0x8C4C, {0xFF80, 0x1030, 0xFF80, 0x0BB4, 0x8000, 0x0164, 0x0000, 0xF9AC},8},
+	{0x8C5C, {0xFF80, 0x0B68, 0xFF80, 0x0314, 0x8000, 0x016C, 0xFF80, 0x0694},8},
+	{0x8C6C, {0x0000, 0xF444, 0xFF80, 0x0CB8, 0x8000, 0x009C, 0xFF80, 0x0AF8},8},
+	{0x8C7C, {0xFF80, 0x0A24, 0xFF80, 0x0B5C, 0x0000, 0x0998, 0x8000, 0x0008},8},
+	{0x8C8C, {0xFF80, 0x0158, 0xFF80, 0x0290, 0xFF00, 0x0618, 0x0000, 0xF1A4},8},
+	{0x8C9C, {0xFF80, 0x10B4, 0x0000, 0xF1B4, 0x0000, 0xF1C4, 0xFF00, 0x33CC},8},
+	{0x8CAC, {0xFF80, 0x0658, 0xFF80, 0x0250, 0x8000, 0x0168, 0xC0F1, 0x0D9A},8},
+	{0x8CBC, {0x0684, 0x17A4, 0xF00E, 0x8E01, 0xB8A4, 0xAE01, 0x8E09, 0x2051},8},
+	{0x8CCC, {0x8000, 0xF29C, 0x17E0, 0xF00D, 0x153A, 0x1080, 0x153B, 0x1081},8},
+	{0x8CDC, {0xB808, 0x7825, 0x16B8, 0x1101, 0x092B, 0x0003, 0x16B0, 0x1082},8},
+	{0x8CEC, {0x1E3C, 0x1082, 0x16B1, 0x1082, 0x1E3D, 0x1082, 0x16B4, 0x1082},8},
+	{0x8CFC, {0x1E3E, 0x1082, 0x16B5, 0x1082, 0x1E3F, 0x1082, 0x8E40, 0xBAA6},8},
+	{0x8D0C, {0xAE40, 0x0991, 0x0022, 0x16BA, 0x1102, 0x0A89, 0x0003, 0x16B2},8},
+	{0x8D1C, {0x1084, 0x0ECA, 0x0664, 0x16B0, 0x1083, 0x1E3C, 0x1002, 0x153A},8},
+	{0x8D2C, {0x1080, 0x153B, 0x1081, 0x16B3, 0x1084, 0xB808, 0x7825, 0x16B8},8},
+	{0x8D3C, {0x1101, 0x16BA, 0x1102, 0x0EA6, 0x0664, 0x16B1, 0x1083, 0x1E3D},8},
+	{0x8D4C, {0x1002, 0x153A, 0x1080, 0x153B, 0x1081, 0x16B6, 0x1084, 0xB808},8},
+	{0x8D5C, {0x7825, 0x16B8, 0x1101, 0x16BA, 0x1102, 0x0E82, 0x0664, 0x16B4},8},
+	{0x8D6C, {0x1083, 0x1E3E, 0x1002, 0x153A, 0x1080, 0x153B, 0x1081, 0x16B7},8},
+	{0x8D7C, {0x1084, 0xB808, 0x7825, 0x16B8, 0x1101, 0x16BA, 0x1102, 0x0E5E},8},
+	{0x8D8C, {0x0664, 0x16B5, 0x1083, 0x1E3F, 0x1002, 0x8E00, 0xB8A6, 0xAE00},8},
+	{0x8D9C, {0x153A, 0x1081, 0x153B, 0x1080, 0xB908, 0x7905, 0x16BA, 0x1100},8},
+	{0x8DAC, {0x0859, 0x0042, 0xD017, 0x9E31, 0x904D, 0x0A2D, 0x0063, 0x8E00},8},
+	{0x8DBC, {0x16B0, 0x1081, 0x1E3C, 0x1042, 0x16B1, 0x1081, 0x1E3D, 0x1042},8},
+	{0x8DCC, {0x16B4, 0x1081, 0x1E3E, 0x1042, 0x16B5, 0x1081, 0x1E3F, 0x1042},8},
+	{0x8DDC, {0xB886, 0xF013, 0x16B2, 0x1081, 0xB8A6, 0x1E3C, 0x1042, 0x16B3},8},
+	{0x8DEC, {0x1081, 0x1E3D, 0x1042, 0x16B6, 0x1081, 0x1E3E, 0x1042, 0x16B7},8},
+	{0x8DFC, {0x1081, 0x1E3F, 0x1042, 0xAE00, 0x0D2A, 0x0184, 0x04B5, 0x0684},8},
+	{0x8E0C, {0xFF80, 0x050C, 0xC0F1, 0x0BAA, 0x0224, 0xC5E1, 0xD067, 0x8000},8},
+	{0x8E1C, {0x880A, 0x085B, 0x019F, 0xD166, 0xD800, 0xA90F, 0xD165, 0x81A1},8},
+	{0x8E2C, {0x8160, 0xD165, 0x2D41, 0x1602, 0x2B41, 0x060C, 0x1934, 0x0082},8},
+	{0x8E3C, {0x1930, 0x0302, 0x2D41, 0x1402, 0x2B41, 0x040C, 0x1935, 0x0082},8},
+	{0x8E4C, {0x1931, 0x0302, 0x2D41, 0x1202, 0x2B41, 0x020C, 0x1936, 0x0082},8},
+	{0x8E5C, {0x1932, 0x0302, 0x1937, 0x0342, 0x1933, 0x00C2, 0xD157, 0x8120},8},
+	{0x8E6C, {0x7208, 0x81A8, 0x7108, 0x7D60, 0x7308, 0x0451, 0x0684, 0x78E0},8},
+	{0x8E7C, {0xC0F1, 0x0AE2, 0x0224, 0xC5E1, 0xD14D, 0x894D, 0x0A63, 0x0002},8},
+	{0x8E8C, {0xD04A, 0x8040, 0x8A0B, 0xB8A6, 0xAA0B, 0xD800, 0xA90F, 0xD149},8},
+	{0x8E9C, {0x8161, 0x81A0, 0xD148, 0x2B41, 0x0602, 0x2D41, 0x160C, 0x1934},8},
+	{0x8EAC, {0x0082, 0x1930, 0x0302, 0x2B41, 0x0402, 0x2D41, 0x140C, 0x1935},8},
+	{0x8EBC, {0x0082, 0x1931, 0x0302, 0x2B41, 0x0202, 0x2D41, 0x120C, 0x1936},8},
+	{0x8ECC, {0x0082, 0x1932, 0x0302, 0x1937, 0x00C2, 0x1933, 0x0342, 0xD13B},8},
+	{0x8EDC, {0x8120, 0x7208, 0x81A8, 0x7108, 0x7D60, 0x7308, 0xF003, 0x0D62},8},
+	{0x8EEC, {0x0204, 0x03D9, 0x0684, 0x78E0, 0xC0F1, 0x0B52, 0x0684, 0xD532},8},
+	{0x8EFC, {0xD733, 0x153A, 0x1080, 0x153B, 0x1081, 0x1528, 0x108E, 0xB808},8},
+	{0x8F0C, {0x7825, 0x703A, 0x152A, 0x1080, 0x152B, 0x1081, 0xBE08, 0xB808},8},
+	{0x8F1C, {0x7825, 0x701A, 0x1529, 0x1080, 0x7E05, 0x8700, 0x800C, 0x7840},8},
+	{0x8F2C, {0xD028, 0x153B, 0x1082, 0x9039, 0x153A, 0x1080, 0xB808, 0x7845},8},
+	{0x8F3C, {0x7822, 0xD11E, 0x8120, 0x912D, 0x082F, 0x0043, 0x2941, 0x2201},8},
+	{0x8F4C, {0x2E41, 0x1200, 0x1D3A, 0x1042, 0x1D28, 0x1002, 0x8700, 0x2841},8},
+	{0x8F5C, {0x2201, 0x1D3B, 0x1442, 0x1D2A, 0x1042, 0x800D, 0x1D2B, 0x1402},8},
+	{0x8F6C, {0x7860, 0x1D29, 0x1382, 0x0335, 0x0684, 0x78E0, 0xC0F1, 0x0B6A},8},
+	{0x8F7C, {0x01C4, 0xD215, 0xD112, 0xA140, 0xC0D1, 0x7EE0, 0xC0F1, 0x0ACA},8},
+	{0x8F8C, {0x06A4, 0xDA44, 0xD111, 0xD512, 0x76A9, 0x085E, 0x06A4, 0x70C9},8},
+	{0x8F9C, {0xD010, 0xA50D, 0xD010, 0xA50C, 0xD010, 0xA510, 0xD010, 0xA500},8},
+	{0x8FAC, {0xD007, 0x0311, 0x06A4, 0xA0C0, 0x8000, 0x000C, 0xFF80, 0x040C},8},
+	{0x8FBC, {0x8000, 0x00A8, 0xFF80, 0x0250, 0x8000, 0x0038, 0x8000, 0x00A4},8},
+	{0x8FCC, {0xFF80, 0x0740, 0xFF80, 0x10C4, 0x0000, 0xF4BC, 0xFF80, 0x10C4},8},
+	{0x8FDC, {0xFF80, 0x0E7C, 0xFF80, 0x0E10, 0xFF80, 0x0EF4, 0xFF80, 0x0F78},8},
+	{0x8FEC, {0xEA0A, 0x242F, 0x7089, 0x78E0, 0x20A8, 0x0180, 0x1002, 0x0D02},8},
+	{0x8FFC, {0x1902, 0x0094, 0x7FE0, 0x7028, 0x7308, 0x1000, 0x0900, 0x7904},8},
+	{0x900C, {0x7947, 0x1B00, 0x0064, 0x7EE0, 0xEA0A, 0x242F, 0x7089, 0x78E0},8},
+	{0x901C, {0x20A8, 0x0180, 0x1102, 0x0502, 0x1802, 0x00B4, 0x7FE0, 0x7028},8},
+
+};
+
+struct mt9p111_reg_cfg 	mt9p111_init1_3[]=
+{
+	{0x902C, 0x0000, 1},
+	{0x902E, 0x0000, 1},
+	{0x098E, 0x0016, 1}, 	// LOGICAL_ADDRESS_ACCESS
+	{0x8016, 0x086C, 1}, 	// MON_ADDRESS_LO
+	{0x8002, 0x0001, 1}, 	// MON_CMD
+};
+
+struct mt9p111_reg_cfg 	mt9p111_init2[]=
+{
+	{0x30D4, 0x9080, 1}, 	// COLUMN_CORRECTION
+	{0x316E, 0xC400, 1}, 	// DAC_ECL
+	{0x305E, 0x10A0, 1}, 	// GLOBAL_GAIN
+	{0x3E00, 0x0010, 1}, 	// SAMP_CONTROL
+	{0x3E02, 0xED02, 1}, 	// SAMP_ADDR_EN
+	{0x3E04, 0xC88C, 1}, 	// SAMP_RD1_SIG
+	{0x3E06, 0xC88C, 1}, 	// SAMP_RD1_SIG_BOOST
+	{0x3E08, 0x700A, 1}, 	// SAMP_RD1_RST
+	{0x3E0A, 0x701E, 1}, 	// SAMP_RD1_RST_BOOST
+	{0x3E0C, 0x00FF, 1}, 	// SAMP_RST1_EN
+	{0x3E0E, 0x00FF, 1}, 	// SAMP_RST1_BOOST
+	{0x3E10, 0x00FF, 1}, 	// SAMP_RST1_CLOOP_SH
+	{0x3E12, 0x0000, 1}, 	// SAMP_RST_BOOST_SEQ
+	{0x3E14, 0xC78C, 1}, 	// SAMP_SAMP1_SIG
+	{0x3E16, 0x6E06, 1}, 	// SAMP_SAMP1_RST
+	{0x3E18, 0xA58C, 1}, 	// SAMP_TX_EN
+	{0x3E1A, 0xA58E, 1}, 	// SAMP_TX_BOOST
+	{0x3E1C, 0xA58E, 1}, 	// SAMP_TX_CLOOP_SH
+	{0x3E1E, 0xC0D0, 1}, 	// SAMP_TX_BOOST_SEQ
+	{0x3E20, 0xEB00, 1}, 	// SAMP_VLN_EN
+	{0x3E22, 0x00FF, 1}, 	// SAMP_VLN_HOLD
+	{0x3E24, 0xEB02, 1}, 	// SAMP_VCL_EN
+	{0x3E26, 0xEA02, 1}, 	// SAMP_COLCLAMP
+	{0x3E28, 0xEB0A, 1}, 	// SAMP_SH_VCL
+	{0x3E2A, 0xEC01, 1}, 	// SAMP_SH_VREF
+	{0x3E2C, 0xEB01, 1}, 	// SAMP_SH_VBST
+	{0x3E2E, 0x00FF, 1}, 	// SAMP_SPARE
+	{0x3E30, 0x00F3, 1}, 	// SAMP_READOUT
+	{0x3E32, 0x3DFA, 1}, 	// SAMP_RESET_DONE
+	{0x3E34, 0x00FF, 1}, 	// SAMP_VLN_CLAMP
+	{0x3E36, 0x00F3, 1}, 	// SAMP_ASC_INT
+	{0x3E38, 0x0000, 1}, 	// SAMP_RS_CLOOP_SH_R
+	{0x3E3A, 0xF802, 1}, 	// SAMP_RS_CLOOP_SH
+	{0x3E3C, 0x0FFF, 1}, 	// SAMP_RS_BOOST_SEQ
+	{0x3E3E, 0xEA10, 1}, 	// SAMP_TXLO_GND
+	{0x3E40, 0xEB05, 1}, 	// SAMP_VLN_PER_COL
+	{0x3E42, 0xE5C8, 1}, 	// SAMP_RD2_SIG
+	{0x3E44, 0xE5C8, 1}, 	// SAMP_RD2_SIG_BOOST
+	{0x3E46, 0x8C70, 1}, 	// SAMP_RD2_RST
+	{0x3E48, 0x8C71, 1}, 	// SAMP_RD2_RST_BOOST
+	{0x3E4A, 0x00FF, 1}, 	// SAMP_RST2_EN
+	{0x3E4C, 0x00FF, 1}, 	// SAMP_RST2_BOOST
+	{0x3E4E, 0x00FF, 1}, 	// SAMP_RST2_CLOOP_SH
+	{0x3E50, 0xE38D, 1}, 	// SAMP_SAMP2_SIG
+	{0x3E52, 0x8B0A, 1}, 	// SAMP_SAMP2_RST
+	{0x3E58, 0xEB0A, 1}, 	// SAMP_PIX_CLAMP_EN
+	{0x3E5C, 0x0A00, 1}, 	// SAMP_PIX_PULLUP_EN
+	{0x3E5E, 0x00FF, 1}, 	// SAMP_PIX_PULLDOWN_EN_R
+	{0x3E60, 0x00FF, 1}, 	// SAMP_PIX_PULLDOWN_EN_S
+	{0x3E90, 0x3C01, 1}, 	// RST_ADDR_EN
+	{0x3E92, 0x00FF, 1}, 	// RST_RST_EN
+	{0x3E94, 0x00FF, 1}, 	// RST_RST_BOOST
+	{0x3E96, 0x3C00, 1}, 	// RST_TX_EN
+	{0x3E98, 0x3C00, 1}, 	// RST_TX_BOOST
+	{0x3E9A, 0x3C00, 1}, 	// RST_TX_CLOOP_SH
+	{0x3E9C, 0xC0E0, 1}, 	// RST_TX_BOOST_SEQ
+	{0x3E9E, 0x00FF, 1}, 	// RST_RST_CLOOP_SH
+	{0x3EA0, 0x0000, 1}, 	// RST_RST_BOOST_SEQ
+	{0x3EA6, 0x3C00, 1}, 	// RST_PIX_PULLUP_EN
+	{0x3ED8, 0x3057, 1}, 	// DAC_LD_12_13
+	{0x316C, 0xB44F, 1}, 	// DAC_TXLO
+	{0x316E, 0xC6FF, 1}, 	// DAC_ECL
+	{0x3ED2, 0xEA0A, 1}, 	// DAC_LD_6_7
+	{0x3ED4, 0x00A3, 1}, 	// DAC_LD_8_9
+	{0x3EDC, 0x6020, 1}, 	// DAC_LD_16_17
+	{0x3EE6, 0xA541, 1}, 	// DAC_LD_26_27
+	{0x31E0, 0x0000, 1}, 	// PIX_DEF_ID
+	{0x3ED0, 0x2409, 1}, 	// DAC_LD_4_5
+	{0x3EDE, 0x0A49, 1}, 	// DAC_LD_18_19
+	{0x3EE0, 0x4909, 1}, 	// DAC_LD_20_21
+	{0x3EE2, 0x09CF, 1}, 	// DAC_LD_22_23
+	{0x30B6, 0x0008, 1}, 	// AUTOLR_CONTROL
+	{0x337C, 0x0006, 1}, 	// YUV_YCBCR_CONTROL
+	{0x3E1A, 0xA582, 1}, 	// SAMP_TX_BOOST
+	{0x3E2E, 0xEC05, 1}, 	// SAMP_SPARE
+	{0x3EE6, 0xA5C0, 1}, 	// DAC_LD_26_27
+	{0x316C, 0xB43F, 1}, 	// DAC_TXLO
+	{0x316E, 0xC6FF, 1}, 	// DAC_ECL
+	// Lens Correction
+	{0x381C, 0x0000, 1}, 	// OTPM_CFG2
+	{0xE02A, 0x0001, 1}, 	// IO_NV_MEM_COMMAND
+};
+
+struct mt9p111_reg_cfg 	mt9p111_init3[]=
+{
+	{0x3812, 0x2124, 1},	// OTPM_CFG
+};
+
+struct mt9p111_reg_cfg 	mt9p111_defalut_Lens_Correction[]=
+{
+	{0x3640, 0x02B0, 1},	// P_G1_P0Q0
+	{0x3642, 0x07EE, 1},	// P_G1_P0Q1
+	{0x3644, 0x3D71, 1},	// P_G1_P0Q2
+	{0x3646, 0xCAEB, 1},	// P_G1_P0Q3
+	{0x3648, 0xFE50, 1},	// P_G1_P0Q4
+	{0x364A, 0x02F0, 1},	// P_R_P0Q0
+	{0x364C, 0xDE8C, 1},	// P_R_P0Q1
+	{0x364E, 0x0211, 1},	// P_R_P0Q2
+	{0x3650, 0x6F4D, 1},	// P_R_P0Q3
+	{0x3652, 0xF070, 1},	// P_R_P0Q4
+	{0x3654, 0x03B0, 1},	// P_B_P0Q0
+	{0x3656, 0x6E8D, 1},	// P_B_P0Q1
+	{0x3658, 0x56D0, 1},	// P_B_P0Q2
+	{0x365A, 0xF36D, 1},	// P_B_P0Q3
+	{0x365C, 0x98F0, 1},	// P_B_P0Q4
+	{0x365E, 0x0150, 1},	// P_G2_P0Q0
+	{0x3660, 0xAD4D, 1},	// P_G2_P0Q1
+	{0x3662, 0x3F71, 1},	// P_G2_P0Q2
+	{0x3664, 0x016D, 1},	// P_G2_P0Q3
+	{0x3666, 0xFA30, 1},	// P_G2_P0Q4
+	{0x3680, 0x1FEA, 1},	// P_G1_P1Q0
+	{0x3682, 0xE0CD, 1},	// P_G1_P1Q1
+	{0x3684, 0x20AC, 1},	// P_G1_P1Q2
+	{0x3686, 0x192E, 1},	// P_G1_P1Q3
+	{0x3688, 0x912E, 1},	// P_G1_P1Q4
+	{0x368A, 0x4EAD, 1},	// P_R_P1Q0
+	{0x368C, 0x316D, 1},	// P_R_P1Q1
+	{0x368E, 0xFA09, 1},	// P_R_P1Q2
+	{0x3690, 0xCB0E, 1},	// P_R_P1Q3
+	{0x3692, 0xB90E, 1},	// P_R_P1Q4
+	{0x3694, 0xA4CE, 1},	// P_B_P1Q0
+	{0x3696, 0x598D, 1},	// P_B_P1Q1
+	{0x3698, 0x60AF, 1},	// P_B_P1Q2
+	{0x369A, 0xF2CE, 1},	// P_B_P1Q3
+	{0x369C, 0x9330, 1},	// P_B_P1Q4
+	{0x369E, 0xB82D, 1},	// P_G2_P1Q0
+	{0x36A0, 0xA86E, 1},	// P_G2_P1Q1
+	{0x36A2, 0x362F, 1},	// P_G2_P1Q2
+	{0x36A4, 0x3D0D, 1},	// P_G2_P1Q3
+	{0x36A6, 0xF6EF, 1},	// P_G2_P1Q4
+	{0x36C0, 0x5F11, 1},	// P_G1_P2Q0
+	{0x36C2, 0x0A4F, 1},	// P_G1_P2Q1
+	{0x36C4, 0xB572, 1},	// P_G1_P2Q2
+	{0x36C6, 0xA16B, 1},	// P_G1_P2Q3
+	{0x36C8, 0x0ED3, 1},	// P_G1_P2Q4
+	{0x36CA, 0x25B1, 1},	// P_R_P2Q0
+	{0x36CC, 0xF18E, 1},	// P_R_P2Q1
+	{0x36CE, 0x90D2, 1},	// P_R_P2Q2
+	{0x36D0, 0x276F, 1},	// P_R_P2Q3
+	{0x36D2, 0x2313, 1},	// P_R_P2Q4
+	{0x36D4, 0x2311, 1},	// P_B_P2Q0
+	{0x36D6, 0x126F, 1},	// P_B_P2Q1
+	{0x36D8, 0xF8D1, 1},	// P_B_P2Q2
+	{0x36DA, 0x870E, 1},	// P_B_P2Q3
+	{0x36DC, 0x12F3, 1},	// P_B_P2Q4
+	{0x36DE, 0x61F1, 1},	// P_G2_P2Q0
+	{0x36E0, 0x92AF, 1},	// P_G2_P2Q1
+	{0x36E2, 0xA1F2, 1},	// P_G2_P2Q2
+	{0x36E4, 0x1310, 1},	// P_G2_P2Q3
+	{0x36E6, 0x6872, 1},	// P_G2_P2Q4
+	{0x3700, 0x364F, 1},	// P_G1_P3Q0
+	{0x3702, 0xA04B, 1},	// P_G1_P3Q1
+	{0x3704, 0xBA6D, 1},	// P_G1_P3Q2
+	{0x3706, 0x6BF0, 1},	// P_G1_P3Q3
+	{0x3708, 0x91F2, 1},	// P_G1_P3Q4
+	{0x370A, 0x1E0F, 1},	// P_R_P3Q0
+	{0x370C, 0x954E, 1},	// P_R_P3Q1
+	{0x370E, 0xDBAF, 1},	// P_R_P3Q2
+	{0x3710, 0x1EF1, 1},	// P_R_P3Q3
+	{0x3712, 0x8A51, 1},	// P_R_P3Q4
+	{0x3714, 0xF66C, 1},	// P_B_P3Q0
+	{0x3716, 0xC10E, 1},	// P_B_P3Q1
+	{0x3718, 0x1BD0, 1},	// P_B_P3Q2
+	{0x371A, 0x0251, 1},	// P_B_P3Q3
+	{0x371C, 0xB5F2, 1},	// P_B_P3Q4
+	{0x371E, 0x736E, 1},	// P_G2_P3Q0
+	{0x3720, 0xA4CE, 1},	// P_G2_P3Q1
+	{0x3722, 0x430F, 1},	// P_G2_P3Q2
+	{0x3724, 0x45B1, 1},	// P_G2_P3Q3
+	{0x3726, 0xAED2, 1},	// P_G2_P3Q4
+	{0x3740, 0x9A11, 1},	// P_G1_P4Q0
+	{0x3742, 0x9350, 1},	// P_G1_P4Q1
+	{0x3744, 0x8D31, 1},	// P_G1_P4Q2
+	{0x3746, 0xD04E, 1},	// P_G1_P4Q3
+	{0x3748, 0x1174, 1},	// P_G1_P4Q4
+	{0x374A, 0x8811, 1},	// P_R_P4Q0
+	{0x374C, 0x292F, 1},	// P_R_P4Q1
+	{0x374E, 0x776F, 1},	// P_R_P4Q2
+	{0x3750, 0x9E71, 1},	// P_R_P4Q3
+	{0x3752, 0x21F3, 1},	// P_R_P4Q4
+	{0x3754, 0xB8D0, 1},	// P_B_P4Q0
+	{0x3756, 0xA010, 1},	// P_B_P4Q1
+	{0x3758, 0x9F0B, 1},	// P_B_P4Q2
+	{0x375A, 0x7190, 1},	// P_B_P4Q3
+	{0x375C, 0x47F3, 1},	// P_B_P4Q4
+	{0x375E, 0x89F1, 1},	// P_G2_P4Q0
+	{0x3760, 0x5D0E, 1},	// P_G2_P4Q1
+	{0x3762, 0x8C12, 1},	// P_G2_P4Q2
+	{0x3764, 0xA891, 1},	// P_G2_P4Q3
+	{0x3766, 0x3D54, 1},	// P_G2_P4Q4
+	{0x3782, 0x03B4, 1},	// CENTER_ROW
+	{0x3784, 0x04F4, 1},	// CENTER_COLUMN
+	{0x3210, 0x49B8, 1},	// COLOR_PIPELINE_CONTROL
+
+};
+
+struct mt9p111_reg_cfg 	mt9p111_opt_memory_data_read[]=
+{
+
+	//[OTP_Memory_Data_Read]
+	{0xE024, 0x0100, 1}, 	// IO_NV_MEM_ADDR [Zone 1 Address] Zone 1 first address read
+	{0xE02A, 0xA010, 1},
+
+	//OTP_Zone_Load
+	//{0x8404, 0x05}, 	// SEQ_CMD
+};
+
+struct mt9p111_reg_cfg 	mt9p111_opt_memory_data_zone_load[]=
+{
+
+	//OTP_Zone_Load
+	{0x8404, 0x05, 0}, 	// SEQ_CMD
+};
+
+struct mt9p111_reg_cfg 	mt9p111_opt_zone_1_load[]=
+{
+	//[OTP_ZONE_1_LOAD]
+	{0xD004, 0x04, 0}, 	// PGA_SOLUTION
+	{0xD006, 0x0100, 1}, 	// PGA_ZONE_ADDR_0
+	{0xD005, 0x01, 0}, 	// PGA_CURRENT_ZONE
+	{0xD002, 0x8002, 1}, 	// PGA_ALGO
+	{0x3210, 0x49B8, 1}, 	// COLOR_PIPELINE_CONTROL
+};
+
+struct mt9p111_reg_cfg 	mt9p111_opt_zone_0_load[]=
+{
+
+	//[OTP_ZONE_0_LOAD]
+	{0xD004, 0x04, 0},// PGA_SOLUTION
+	{0xD006, 0x0000, 1}, 	// PGA_ZONE_ADDR_0
+	{0xD005, 0x00, 0},	// PGA_CURRENT_ZONE
+	{0xD002, 0x8002, 1}, 	// PGA_ALGO
+	{0x3210, 0x49B8, 1}, 	// COLOR_PIPELINE_CONTROL
+};
+
+struct mt9p111_reg_cfg 	mt9p111_awb_ccm[]=
+{
+	//[AWB_CCM]
+	{0xAC02, 0x00FF, 1},	// RESERVED_AWB_02
+	{0xAC01, 0xEF , 0},	// AWB_MODE
+	{0xAC09, 0x01 , 0},	// RESERVED_AWB_09
+	{0xAC22, 0x0000, 1},	// RESERVED_AWB_22
+	{0xACB0, 0x30, 0}, 	// AWB_RG_MIN
+	{0xACB1, 0x5a, 0}, 	// AWB_RG_MAX
+	{0xACB4, 0x34, 0}, 	// AWB_BG_MIN
+	{0xACB5, 0x5b, 0}, 	// AWB_BG_MAX
+	{0xACB2, 0x42, 0}, 	// AWB_RG_MIN_BRIGHT
+	{0xACB3, 0x46, 0}, 	// AWB_RG_MAX_BRIGHT
+	{0xACB6, 0x3C, 0}, 	// AWB_BG_MIN_BRIGHT
+	{0xACB7, 0x44, 0}, 	// AWB_BG_MAX_BRIGHT
+	{0xACB8, 0x0100, 1},	// AWB_START_NUM_INT_LINES
+	{0xACBA, 0x00B0, 1},	// AWB_END_NUM_INT_LINES
+	{0xAC46, 0x0233, 1},	// AWB_LEFT_CCM_0
+	{0xAC48, 0xFEDA, 1},	// AWB_LEFT_CCM_1
+	{0xAC4A, 0xFFF2, 1},	// AWB_LEFT_CCM_2
+	{0xAC4C, 0xFF83, 1},	// AWB_LEFT_CCM_3
+	{0xAC4E, 0x019B, 1},	// AWB_LEFT_CCM_4
+	{0xAC50, 0xFFE0, 1},	// AWB_LEFT_CCM_5
+	{0xAC52, 0xFFE6, 1},	// AWB_LEFT_CCM_6
+	{0xAC54, 0xFEBF, 1},	// AWB_LEFT_CCM_7
+	{0xAC56, 0x025C, 1},	// AWB_LEFT_CCM_8
+	{0xAC58, 0x0091, 1},	// AWB_LEFT_CCM_R2BRATIO
+	{0xAC5C, 0x031E, 1},	// AWB_RIGHT_CCM_0
+	{0xAC5E, 0xFE59, 1},	// AWB_RIGHT_CCM_1
+	{0xAC60, 0xFF79, 1},	// AWB_RIGHT_CCM_2
+	{0xAC62, 0xFFE0, 1},	// AWB_RIGHT_CCM_3
+	{0xAC64, 0x0136, 1},	// AWB_RIGHT_CCM_4
+	{0xAC66, 0xFFEE, 1},	// AWB_RIGHT_CCM_5
+	{0xAC68, 0x0007, 1},	// AWB_RIGHT_CCM_6
+	{0xAC6A, 0xFF38, 1},	// AWB_RIGHT_CCM_7
+	{0xAC6C, 0x01BC, 1},	// AWB_RIGHT_CCM_8
+	{0xAC6E, 0x0066, 1},	// AWB_RIGHT_CCM_R2BRATIO
+	{0xAC3C, 0x26, 0}, 	// AWB_MIN_ACCEPTED_PRE_AWB_R2G_RATIO
+	{0xAC3D, 0x6E, 0}, 	// AWB_MAX_ACCEPTED_PRE_AWB_R2G_RATIO
+	{0xAC3E, 0x14, 0}, 	// AWB_MIN_ACCEPTED_PRE_AWB_B2G_RATIO
+	{0xAC3F, 0x6F, 0}, 	// AWB_MAX_ACCEPTED_PRE_AWB_B2G_RATIO
+	{0xAC72, 0x0100, 1},	// AWB_LL_CCM_0
+	{0xAC74, 0x0000, 1},	// AWB_LL_CCM_1
+	{0xAC76, 0x0000, 1},	// AWB_LL_CCM_2
+	{0xAC78, 0x0000, 1},	// AWB_LL_CCM_3
+	{0xAC7A, 0x0100, 1},	// AWB_LL_CCM_4
+	{0xAC7C, 0x0000, 1},	// AWB_LL_CCM_5
+	{0xAC7E, 0x0000, 1},	// AWB_LL_CCM_6
+	{0xAC80, 0x0000, 1},	// AWB_LL_CCM_7
+	{0xAC82, 0x0100, 1},	// AWB_LL_CCM_8
+	{0xB83E, 0x00, 0}, 	// STAT_AWB_WINDOW_POS_X
+	{0xB83F, 0x00, 0}, 	// STAT_AWB_WINDOW_POS_Y
+	{0xB840, 0xFE, 0}, 	// STAT_AWB_WINDOW_SIZE_X
+	{0xB841, 0xEF, 0}, 	// STAT_AWB_WINDOW_SIZE_Y
+	{0xAC97, 0x70, 0}, 	// RESERVED_AWB_97
+	{0xAC98, 0x7A, 0}, 	// RESERVED_AWB_98
+	{0xAC99, 0x84, 0}, 	// RESERVED_AWB_99
+	{0xAC9A, 0x7C, 0}, 	// RESERVED_AWB_9A
+	{0xAC9B, 0x80, 0}, 	// RESERVED_AWB_9B
+	{0xAC9C, 0x7E, 0}, 	// RESERVED_AWB_9C
+	{0xB842, 0x0038, 1},	// STAT_AWB_GRAY_CHECKER_OFFSET_X
+	{0xB844, 0x0034, 1},	// STAT_AWB_GRAY_CHECKER_OFFSET_Y
+	{0x3240, 0x0024, 1},	// AWB_XY_SCALE
+	{0x3242, 0x0000, 1},	// AWB_WEIGHT_R0
+	{0x3244, 0xAA80, 1},	// AWB_WEIGHT_R1
+	{0x3246, 0x5580, 1},	// AWB_WEIGHT_R2
+	{0x3248, 0x3700, 1},	// AWB_WEIGHT_R3
+	{0x324A, 0x39C0, 1},	// AWB_WEIGHT_R4
+	{0x324C, 0x03E0, 1},	// AWB_WEIGHT_R5
+	{0x324E, 0x00AB, 1},	// AWB_WEIGHT_R6
+	{0x3250, 0x002A, 1},	// AWB_WEIGHT_R7
+	{0x301A, 0x10F4, 1},	// RESET_REGISTER
+	{0x301E, 0x0083, 1},	// DATA_PEDESTAL
+	{0x301A, 0x10FC, 1},	// RESET_REGISTER
+	{0xDC33, 0x24, 0}, 	// SYS_FIRST_BLACK_LEVEL
+	{0xDC35, 0x04, 0}, 	// SYS_UV_COLOR_BOOST
+	{0x326E, 0x0006, 1},	// RESERVED_SOC1_326E
+	{0xDC37, 0x62,	0}, // SYS_BRIGHT_COLORKILL
+	{0x35A4, 0x0594, 1},	  // BRIGHT_COLOR_KILL_CONTROLS
+	{0x35A2, 0x0094, 1},	 // DARK_COLOR_KILL_CONTROLS
+	{0xDC36, 0x24, 0}, 	// SYS_DARK_COLOR_KILL
+	//0602 0.35 4 1.2
+#if 0
+	{0xBC18, 0x00, 0}, 	// LL_GAMMA_CONTRAST_CURVE_0
+	{0xBC19, 0x16, 0}, 	// LL_GAMMA_CONTRAST_CURVE_1
+	{0xBC1A, 0x36, 0}, 	// LL_GAMMA_CONTRAST_CURVE_2
+	{0xBC1B, 0x53, 0}, 	// LL_GAMMA_CONTRAST_CURVE_3
+	{0xBC1C, 0x74, 0}, 	// LL_GAMMA_CONTRAST_CURVE_4
+	{0xBC1D, 0x8C, 0}, 	// LL_GAMMA_CONTRAST_CURVE_5
+	{0xBC1E, 0x9E, 0}, 	// LL_GAMMA_CONTRAST_CURVE_6
+	{0xBC1F, 0xAD, 0}, 	// LL_GAMMA_CONTRAST_CURVE_7
+	{0xBC20, 0xB9, 0}, 	// LL_GAMMA_CONTRAST_CURVE_8
+	{0xBC21, 0xC3, 0}, 	// LL_GAMMA_CONTRAST_CURVE_9
+	{0xBC22, 0xCD, 0}, 	// LL_GAMMA_CONTRAST_CURVE_10
+	{0xBC23, 0xD5, 0}, 	// LL_GAMMA_CONTRAST_CURVE_11
+	{0xBC24, 0xDC, 0}, 	// LL_GAMMA_CONTRAST_CURVE_12
+	{0xBC25, 0xE3, 0}, 	// LL_GAMMA_CONTRAST_CURVE_13
+	{0xBC26, 0xEA, 0}, 	// LL_GAMMA_CONTRAST_CURVE_14
+	{0xBC27, 0xEF, 0}, 	// LL_GAMMA_CONTRAST_CURVE_15
+	{0xBC28, 0xF5, 0}, 	// LL_GAMMA_CONTRAST_CURVE_16
+	{0xBC29, 0xFA, 0}, 	// LL_GAMMA_CONTRAST_CURVE_17
+	{0xBC2A, 0xFF, 0}, 	// LL_GAMMA_CONTRAST_CURVE_18
+	{0xBC2B, 0x00, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_0
+	{0xBC2C, 0x27, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_1
+	{0xBC2D, 0x3C, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_2
+	{0xBC2E, 0x55, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_3
+	{0xBC2F, 0x77, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_4
+	{0xBC30, 0x90, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_5
+	{0xBC31, 0xA2, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_6
+	{0xBC32, 0xB0, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_7
+	{0xBC33, 0xBC, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_8
+	{0xBC34, 0xC7, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_9
+	{0xBC35, 0xD0, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_10
+	{0xBC36, 0xD8, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_11
+	{0xBC37, 0xDF, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_12
+	{0xBC38, 0xE5, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_13
+	{0xBC39, 0xEB, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_14
+	{0xBC3A, 0xF1, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_15
+	{0xBC3B, 0xF6, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_16
+	{0xBC3C, 0xFB, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_17
+	{0xBC3D, 0xFF, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_18
+#else  // 0609
+	{0xBC18, 0x00, 0}, 	// LL_GAMMA_CONTRAST_CURVE_0
+	{0xBC19, 0x15, 0}, 	// LL_GAMMA_CONTRAST_CURVE_1
+	{0xBC1A, 0x35, 0}, 	// LL_GAMMA_CONTRAST_CURVE_2
+	{0xBC1B, 0x51, 0}, 	// LL_GAMMA_CONTRAST_CURVE_3
+	{0xBC1C, 0x74, 0}, 	// LL_GAMMA_CONTRAST_CURVE_4
+	{0xBC1D, 0x8D, 0}, 	// LL_GAMMA_CONTRAST_CURVE_5
+	{0xBC1E, 0x9F,  0}, 	// LL_GAMMA_CONTRAST_CURVE_6
+	{0xBC1F, 0xAE,  0}, 	// LL_GAMMA_CONTRAST_CURVE_7
+	{0xBC20, 0xBA, 0}, 	// LL_GAMMA_CONTRAST_CURVE_8
+	{0xBC21, 0xC5, 0}, 	// LL_GAMMA_CONTRAST_CURVE_9
+	{0xBC22, 0xCE, 0}, 	// LL_GAMMA_CONTRAST_CURVE_10
+	{0xBC23, 0xD6, 0}, 	// LL_GAMMA_CONTRAST_CURVE_11
+	{0xBC24, 0xDD, 0}, 	// LL_GAMMA_CONTRAST_CURVE_12
+	{0xBC25, 0xE4, 0}, 	// LL_GAMMA_CONTRAST_CURVE_13
+	{0xBC26, 0xEA, 0}, 	// LL_GAMMA_CONTRAST_CURVE_14
+	{0xBC27, 0xF0, 0}, 	// LL_GAMMA_CONTRAST_CURVE_15
+	{0xBC28, 0xF5, 0}, 	// LL_GAMMA_CONTRAST_CURVE_16
+	{0xBC29, 0xFA, 0}, 	// LL_GAMMA_CONTRAST_CURVE_17
+	{0xBC2A, 0xFF,  0}, 	// LL_GAMMA_CONTRAST_CURVE_18
+	
+	{0xBC2B, 0x00, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_0
+	{0xBC2C, 0x1C, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_1
+	{0xBC2D, 0x38, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_2
+	{0xBC2E, 0x53 , 0}, 	// LL_GAMMA_NEUTRAL_CURVE_3
+	{0xBC2F, 0x75 , 0}, 	// LL_GAMMA_NEUTRAL_CURVE_4
+	{0xBC30, 0x8E , 0}, 	// LL_GAMMA_NEUTRAL_CURVE_5
+	{0xBC31, 0xA1, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_6
+	{0xBC32, 0xB0, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_7
+	{0xBC33, 0xBC, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_8
+	{0xBC34, 0xC6, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_9
+	{0xBC35, 0xCF, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_10
+	{0xBC36, 0xD7, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_11
+	{0xBC37, 0xDF, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_12
+	{0xBC38, 0xE5 , 0}, 	// LL_GAMMA_NEUTRAL_CURVE_13
+	{0xBC39, 0xEB , 0}, 	// LL_GAMMA_NEUTRAL_CURVE_14
+	{0xBC3A, 0xF1 , 0}, 	// LL_GAMMA_NEUTRAL_CURVE_15
+	{0xBC3B, 0xF6 , 0}, 	// LL_GAMMA_NEUTRAL_CURVE_16
+	{0xBC3C, 0xFB, 0}, 	// LL_GAMMA_NEUTRAL_CURVE_17
+	{0xBC3D, 0xFF , 0}, 	// LL_GAMMA_NEUTRAL_CURVE_18
+#endif
+	{0xBC3E, 0x00, 0}, 	// LL_GAMMA_NR_CURVE_0
+	{0xBC3F, 0x16, 0}, 	// LL_GAMMA_NR_CURVE_1
+	{0xBC40, 0x23, 0}, 	// LL_GAMMA_NR_CURVE_2
+	{0xBC41, 0x36, 0}, 	// LL_GAMMA_NR_CURVE_3
+	{0xBC42, 0x50, 0}, 	// LL_GAMMA_NR_CURVE_4
+	{0xBC43, 0x65, 0}, 	// LL_GAMMA_NR_CURVE_5
+	{0xBC44, 0x76, 0}, 	// LL_GAMMA_NR_CURVE_6
+	{0xBC45, 0x86, 0}, 	// LL_GAMMA_NR_CURVE_7
+	{0xBC46, 0x94, 0}, 	// LL_GAMMA_NR_CURVE_8
+	{0xBC47, 0xA1, 0}, 	// LL_GAMMA_NR_CURVE_9
+	{0xBC48, 0xAE, 0}, 	// LL_GAMMA_NR_CURVE_10
+	{0xBC49, 0xBA, 0}, 	// LL_GAMMA_NR_CURVE_11
+	{0xBC4A, 0xC5, 0}, 	// LL_GAMMA_NR_CURVE_12
+	{0xBC4B, 0xCF, 0}, 	// LL_GAMMA_NR_CURVE_13
+	{0xBC4C, 0xDA, 0}, 	// LL_GAMMA_NR_CURVE_14
+	{0xBC4D, 0xE3, 0}, 	// LL_GAMMA_NR_CURVE_15
+	{0xBC4E, 0xED, 0}, 	// LL_GAMMA_NR_CURVE_16
+	{0xBC4F, 0xF6, 0}, 	// LL_GAMMA_NR_CURVE_17
+	{0xBC50, 0xFF, 0}, 	// LL_GAMMA_NR_CURVE_18
+	{0xB801, 0xE0, 0}, 	// STAT_MODE
+	{0xB862, 0x04, 0}, 	// STAT_BMTRACKING_SPEED
+	{0xB829, 0x02, 0}, 	// STAT_LL_BRIGHTNESS_METRIC_DIVISOR
+	{0xB863, 0x02, 0}, 	// STAT_BM_MUL
+	{0xB827, 0x0F, 0}, 	// STAT_AE_EV_SHIFT
+	{0xA805, 0x09, 0}, 	// RESERVED_AE_TRACK_05
+	{0xA818, 0x0420, 1},	// AE_TRACK_TARGET_INT_TIME_ROWS
+	{0xA81A, 0x0C00, 1},	// AE_TRACK_MAX_INT_TIME_ROWS
+	{0xA401, 0x00, 0}, 	  // AE_RULE_MODE
+	{0xA402, 0x0004, 1},	// RESERVED_AE_RULE_02
+//	{0xA409, 0x3A, 0}, 	// AE_RULE_BASE_TARGET
+	{0xA409, 0x35, 0}, 	// AE_RULE_BASE_TARGET 2011.06.06
+	{0xA805, 0x09, 0}, 	// RESERVED_AE_TRACK_05
+	{0xA801, 0x00, 0}, 	// AE_TRACK_MODE
+	{0xA802, 0x0007, 1},	// RESERVED_AE_TRACK_02
+	{0xB40C, 0x0140, 1},	// AS_MAX_AGAIN
+	{0xB40E, 0x0100, 1},	// AS_MAX_DGAIN
+	{0xA81C, 0x0040, 1},	// AE_TRACK_MIN_AGAIN
+	{0xA81E, 0x0100, 1},	// AE_TRACK_TARGET_AGAIN
+	{0xA820, 0x0130, 1},	// AE_TRACK_MAX_AGAIN
+	{0xA824, 0x00E6, 1},	// AE_TRACK_MAX_DGAIN
+	{0xA822, 0x0080, 1},	// AE_TRACK_MIN_DGAIN
+	{0xC8E6, 0x014C, 1},	// RESERVED_CAM_E6
+	{0xC8E8, 0x0040, 1},	// RESERVED_CAM_E8
+	{0xBC52, 0x00C8, 1},	// LL_START_BRIGHTNESS_METRIC
+	{0xBC54, 0x0A28, 1},	// LL_END_BRIGHTNESS_METRIC
+	{0xBC58, 0x00F0, 1},	// LL_START_GAIN_METRIC
+	{0xBC5A, 0x05DC, 1},	// LL_END_GAIN_METRIC
+	{0xBC86, 0x00C0, 1},	// LL_START_FFNR_GM
+	{0xBC88, 0x00A0, 1},	// LL_END_FFNR_GM
+	{0xBCBC, 0x0010, 1},	// LL_SFFB_START_GAIN
+	{0xBCBE, 0x01FC, 1},	// LL_SFFB_END_GAIN
+	{0xBCCC, 0x00C8, 1},	// LL_SFFB_START_MAX_GM
+	{0xBCCE, 0x0640, 1},	// LL_SFFB_END_MAX_GM
+	{0xBC90, 0x00C8, 1},	// LL_START_GRB_GM
+	{0xBC92, 0x0640, 1},	// LL_END_GRB_GM
+	{0xBC0E, 0x0032, 1},	// LL_GAMMA_CURVE_ADJ_START_POS
+	{0xBC10, 0x0064, 1},	// LL_GAMMA_CURVE_ADJ_MID_POS
+	{0xBC12, 0x07D0, 1},	// LL_GAMMA_CURVE_ADJ_END_POS
+	{0xBCAA, 0x03E8, 1},	// LL_CDC_THR_ADJ_START_POS
+	{0xBCAC, 0x012C, 1},	// LL_CDC_THR_ADJ_MID_POS
+	{0xBCAE, 0x0009, 1},	// LL_CDC_THR_ADJ_END_POS
+	{0xBCD8, 0x00C8, 1},	// LL_PCR_START_BM
+	{0xBCDA, 0x0A28, 1},	// LL_PCR_END_BM
+//	{0x3380, 0x0504, 1},	// KERNEL_CONFIG
+//	{0x3380, 0x0505, 1},	// KERNEL_CONFIG
+//	{0x3380, 0x0584, 1},	// KERNEL_CONFIG
+//	{0x3380, 0x0586, 1},	// KERNEL_CONFIG
+//	{0x3380, 0x0587, 1},	// KERNEL_CONFIG
+	{0x3380, 0x0401, 1},	// KERNEL_CONFIG  0915
+	{0xBC94, 0x06, 0}, 	// LL_GB_START_THRESHOLD_0
+	{0xBC95, 0x05, 0}, 	// LL_GB_START_THRESHOLD_1
+	{0xBC9C, 0x09, 0}, 	// RESERVED_LL_9C
+	{0xBC9D, 0x05, 0}, 	// RESERVED_LL_9D
+	{0x33B0, 0x2A16, 1},	// FFNR_ALPHA_BETA
+	{0xBC8A, 0x00, 0}, 	// LL_START_FF_MIX_THRESH_Y
+	{0xBC8B, 0x4C, 0}, 	// LL_END_FF_MIX_THRESH_Y
+	{0xBC8C, 0x00, 0}, 	// LL_START_FF_MIX_THRESH_YGAIN
+	{0xBC8D, 0x24, 0}, 	// LL_END_FF_MIX_THRESH_YGAIN
+	{0xBC8E, 0xFF, 0}, 	// LL_START_FF_MIX_THRESH_GAIN
+	{0xBC8F, 0x00, 0}, 	// LL_END_FF_MIX_THRESH_GAIN
+	{0xBCB2, 0x20, 0}, 	// LL_CDC_DARK_CLUS_SLOPE
+	{0xBCB3, 0x3A, 0}, 	// LL_CDC_DARK_CLUS_SATUR
+	{0xBCB4, 0x39, 0}, 	// RESERVED_LL_B4
+	{0xBCB7, 0x39, 0}, 	// RESERVED_LL_B7
+	{0xBCB5, 0x20, 0}, 	// RESERVED_LL_B5
+	{0xBCB8, 0x3A, 0}, 	// RESERVED_LL_B8
+	{0xBCB6, 0x80, 0}, 	// RESERVED_LL_B6
+	{0xBCB9, 0x24, 0}, 	// RESERVED_LL_B9
+	{0x33BA, 0x0075, 1},	// APEDGE_CONTROL
+	{0x33BE, 0x0000, 1},	// UA_KNEE_L
+	{0x33C2, 0x5500, 1},	// UA_WEIGHTS
+	{0xBC5E, 0x0300, 1},	// LL_START_APERTURE_GAIN_BM
+	{0xBC60, 0x0310, 1},	// LL_END_APERTURE_GAIN_BM
+	{0xBC62, 0x03, 0}, 	// LL_START_APERTURE_KPGAIN
+	{0xBC63, 0x10, 0}, 	// LL_END_APERTURE_KPGAIN
+	{0xBC64, 0x03, 0}, 	// LL_START_APERTURE_KNGAIN
+	{0xBC65, 0x10, 0}, 	// LL_END_APERTURE_KNGAIN
+	{0xBCE2, 0x03, 0}, 	// LL_START_POS_KNEE
+	{0xBCE3, 0x1A, 0}, 	// LL_END_POS_KNEE
+	{0xBCE4, 0x03, 0}, 	// LL_START_NEG_KNEE
+	{0xBCE5, 0x1A, 0}, 	// LL_END_NEG_KNEE
+	{0xBCC0, 0x20, 0}, 	// LL_SFFB_RAMP_START
+	{0xBCC1, 0x03, 0}, 	// LL_SFFB_RAMP_STOP
+	{0xBCC2, 0x1E, 0}, 	// LL_SFFB_SLOPE_START
+	{0xBCC3, 0x10, 0}, 	// LL_SFFB_SLOPE_STOP
+	{0xBCC4, 0x07, 0}, 	// LL_SFFB_THSTART
+	{0xBCC5, 0x0B, 0}, 	// LL_SFFB_THSTOP
+	{0xBCBA, 0x0009, 1},	// LL_SFFB_CONFIG
+	{0x098E, 0x3C14, 1},	// LOGICAL_ADDRESS_ACCESS
+	{0xBC14, 0xFFFF, 1},	// LL_GAMMA_FADE_TO_BLACK_START_POS
+	{0xBC16, 0xFFFF, 1},	// LL_GAMMA_FADE_TO_BLACK_END_POS
+	{0xBC66, 0x0154, 1},	// LL_START_APERTURE_GM
+	{0xBC68, 0x07D0, 1},	// LL_END_APERTURE_GM
+	{0xBC6A, 0x07, 0}, 	// LL_START_APERTURE_INTEGER_GAIN
+	{0xBC6B, 0x00, 0}, 	// LL_END_APERTURE_INTEGER_GAIN
+	{0xBC6C, 0x00, 0}, 	// LL_START_APERTURE_EXP_GAIN
+	{0xBC6D, 0x00, 0}, 	// LL_END_APERTURE_EXP_GAIN
+	{0xBC56, 0xC0, 0}, 	// LL_START_CCM_SATURATION
+	{0xBC57, 0x00, 0}, 	// LL_END_CCM_SATURATION
+	{0xBCDE, 0x03, 0}, 	// LL_START_SYS_THRESHOLD
+	{0xBCDF, 0x50, 0}, 	// LL_STOP_SYS_THRESHOLD
+	{0xBCE0, 0x08, 0}, 	// LL_START_SYS_GAIN
+	{0xBCE1, 0x03, 0}, 	// LL_STOP_SYS_GAIN
+	{0xBCD0, 0x000A, 1},	// LL_SFFB_SOBEL_FLAT_START
+	{0xBCD2, 0x00FE, 1},	// LL_SFFB_SOBEL_FLAT_STOP
+	{0xBCD4, 0x001E, 1},	// LL_SFFB_SOBEL_SHARP_START
+	{0xBCD6, 0x00FF, 1},	// LL_SFFB_SOBEL_SHARP_STOP
+	{0xBCC6, 0x00, 0}, 	// LL_SFFB_SHARPENING_START
+	{0xBCC7, 0x00, 0}, 	// LL_SFFB_SHARPENING_STOP
+	{0xBCC8, 0x20, 0}, 	// LL_SFFB_FLATNESS_START
+	{0xBCC9, 0x40, 0}, 	// LL_SFFB_FLATNESS_STOP
+	{0xBCCA, 0x04, 0}, 	// LL_SFFB_TRANSITION_START
+	{0xBCCB, 0x00, 0}, 	// LL_SFFB_TRANSITION_STOP
+	{0xBCE6, 0x00, 0}, 	// LL_SFFB_ZERO_ENABLE
+	{0xC8ED, 0x03, 0}, 	// CAM_TX_ENABLE_MODE
+	{0x098E, 0xC8BC, 1},	// LOGICAL_ADDRESS_ACCESS
+	{0xC8BC, 0x04, 0}, 	// CAM_OUTPUT_0_JPEG_QSCALE_0
+	{0xC8BD, 0x0A, 0}, 	// CAM_OUTPUT_0_JPEG_QSCALE_1
+	{0xC8D2, 0x04, 0}, 	// CAM_OUTPUT_1_JPEG_QSCALE_0
+	{0xC8D3, 0x0A, 0}, 	// CAM_OUTPUT_1_JPEG_QSCALE_1
+	{0xDC3A, 0x23, 0}, 	// SYS_SEPIA_CR
+	{0xDC3B, 0xB2, 0}, 	// SYS_SEPIA_CB
+	{0x098E, 0xBC8A, 1},	// LOGICAL_ADDRESS_ACCESS
+	{0xBC8A, 0x33, 0}, 	// LL_START_FF_MIX_THRESH_Y
+	{0xBC8B, 0x4C, 0}, 	// LL_END_FF_MIX_THRESH_Y
+	{0xBC8C, 0x33, 0}, 	// LL_START_FF_MIX_THRESH_YGAIN
+	{0xBC8D, 0x4C, 0}, 	// LL_END_FF_MIX_THRESH_YGAIN
+	{0xBC8E, 0x55, 0}, 	// LL_START_FF_MIX_THRESH_GAIN
+	{0xBC8F, 0x00, 0}, 	// LL_END_FF_MIX_THRESH_GAIN
+	{0xC400, 0x88, 0}, 	// AFM_ALGO
+	{0x8419, 0x05, 0}, 	// SEQ_STATE_CFG_1_AF
+	{0xB004, 0x0002, 1},	// AF_ALGO
+	{0xC40A, 0x0000, 1},	// AFM_POS_MIN
+	{0xC40C, 0x00E0, 1},	// AFM_POS_MAX
+	{0xB002, 0x0380, 1},	// AF_MODE
+	{0xB018, 0x00, 0}, 	// AF_FS_POS_0
+	{0xB019, 0x1E, 0}, 	// AF_FS_POS_1
+	{0xB01A, 0x2D, 0}, 	// AF_FS_POS_2
+	{0xB01B, 0x3C, 0}, 	// AF_FS_POS_3
+	{0xB01C, 0x4B, 0}, 	// AF_FS_POS_4
+	{0xB01D, 0x5A, 0}, 	// AF_FS_POS_5
+	{0xB01E, 0x69, 0}, 	// AF_FS_POS_6
+	{0xB01F, 0x78, 0}, 	// AF_FS_POS_7
+	{0xB020, 0x87, 0}, 	// AF_FS_POS_8
+	{0xB021, 0x96, 0}, 	// AF_FS_POS_9
+	{0xB022, 0xA5, 0}, 	// AF_FS_POS_10
+	{0xB023, 0xB4, 0}, 	// AF_FS_POS_11
+	{0xB024, 0xC3, 0}, 	// AF_FS_POS_12
+	{0xB012, 0x0D, 0}, 	// AF_FS_NUM_STEPS
+	{0xB014, 0x0F, 0}, 	// AF_FS_STEP_SIZE
+	{0xB013, 0x77, 0}, 	// AF_FS_NUM_STEPS2
+	{0xB045, 0x0015, 1},	// AF_MODE_EX
+	{0xB02C, 0x14, 0}, 	// AF_HC_STEP
+	{0xB02D, 0x28, 0}, 	// AF_HC_LONG_STEP
+	{0xB02E, 0x3C, 0}, 	// AF_HC_LONG_STEP_USE_THR
+	{0xB036, 0x2420, 1},	// AF_MD_TH_FOR_STARTING_MOT_EVAL
+	{0xB038, 0x2414, 1},	// AF_MD_TH_USED_DURING_MOT_EVAL
+	{0xB03A, 0x0101, 1},	// AF_MD_TH_FOR_ENDING_MOT_EVAL
+	{0xB03C, 0x2414, 1},	// AF_MD_TH_FOR_FOCUSING_AFTER_MOT
+	{0xB040, 0x01 , 0},	// AF_MD_MOTION_DETECTED
+	{0x098E, 0xB820, 1},	// LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_0_IMAGE_WIDTH]
+	{0xB820, 0x30, 0}, 	// STAT_AE_WINDOW_POS_X
+	{0xB821, 0x40, 0}, 	// STAT_AE_WINDOW_POS_Y
+	{0xB822, 0xa0, 0}, 	// STAT_AE_WINDOW_SIZE_X
+	{0xB823, 0x90, 0}, 	// STAT_AE_WINDOW_SIZE_Y
+	{0x098E, 0xB828, 1},    // LOGICAL_ADDRESS_ACCESS [STAT_AE_SIZE_PERCENT]
+	{0xB828, 0x50, 0},      // STAT_AE_SIZE_PERCENT
+#if 1
+	{0xC8AA, 0x0400, 1},	// CAM_OUTPUT_0_IMAGE_WIDTH
+	{0xC8AC, 0x0300, 1},	// CAM_OUTPUT_0_IMAGE_HEIGHT liujianhua test 0x0302
+#endif
+	{0x8404, 0x06	, 0},	// SEQ_CMD
+
+};
+
+struct mt9p111_reg_cfg 	mt9p111_awb_ccm_post[]=
+{
+	
+	{0x3EDA, 0x6060, 1},	// DAC_LD_14_15
+	{0x098E, 0x843C, 1},	// LOGICAL_ADDRESS_ACCESS
+	{0x843C, 0x01, 0},	// SEQ_STATE_CFG_5_MAX_FRAME_CNT
+	{0x8404, 0x01, 0},	// SEQ_CMD
+	{0x3170, 0x2096, 1},	// ANALOG_CONTROL
+};
+
+
+struct mt9p111_reg_cfg 	mt9p111_af_trigger[]=
+{
+	//[AF - Trigger]
+	//;Full_Scan_Trigger
+	{0x098E, 0x8419, 1},   	// LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_1_AF]
+	{0x8419, 0x05, 	0},   // SEQ_STATE_CFG_1_AF
+	{0x8404, 0x05, 0	},   // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg 	mt9p111_af_process[]=
+{
+
+	{0xB006, 0x01, 0},	// AF_PROGRESS	
+};
+
+struct mt9p111_reg_cfg 	mt9p111_preview_720480[]=
+{
+	{0x098E, 0x48AA ,1},     // LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_0_IMAGE_WIDTH]
+	{0xC8AA, 0x02D0 ,1},    // CAM_OUTPUT_0_IMAGE_WIDTH
+	{0xC8AC, 0x01E0 ,1},    // CAM_OUTPUT_0_IMAGE_HEIGHT
+	{0x8404, 0x06  ,0},       // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg  mt9p111_preview_1024768[]=
+{
+        {0x098E, 0x48AA ,1},     // LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_0_IMAGE_WIDTH]
+        {0xC8AA, 0x0400 ,1},    // CAM_OUTPUT_0_IMAGE_WIDTH
+        {0xC8AC, 0x0300 ,1},    // CAM_OUTPUT_0_IMAGE_HEIGHT
+        {0x8404, 0x06  ,0},       // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg  mt9p111_preview_1280960[]=
+{
+        {0x098E, 0x48AA ,1},     // LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_0_IMAGE_WIDTH]
+        {0xC8AA, 0x0500 ,1},    // CAM_OUTPUT_0_IMAGE_WIDTH
+        {0xC8AC, 0x03C0 ,1},    // CAM_OUTPUT_0_IMAGE_HEIGHT
+        {0x8404, 0x06  ,0},       // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg 	mt9p111_preview_power[]=
+{
+
+	//[Preview_power]
+//	{0x3EDA, 0x6060, 1},  	// DAC_LD_14_15
+	{0x098E, 0x843C, 1},  	// LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_5_MAX_FRAME_CNT]
+	{0x843C, 0x01, 0}, 	// SEQ_STATE_CFG_5_MAX_FRAME_CNT
+	{0x8404, 0x01, 0}, 	// SEQ_CMD
+#if 0
+	{0x098E, 0xB828, 1},    // LOGICAL_ADDRESS_ACCESS [STAT_AE_SIZE_PERCENT]
+	{0xB828, 0x50, 0},      // STAT_AE_SIZE_PERCENT
+	{0x8404, 0x06, 0},      // SEQ_CMD
+#endif
+
+};
+
+struct mt9p111_reg_cfg 	mt9p111_analog_control[]=
+{
+	{0x3170, 0x2096, 1},	// ANALOG_CONTROL
+	{0x098E, 0xB828, 1},    // LOGICAL_ADDRESS_ACCESS [STAT_AE_SIZE_PERCENT]
+	{0xB828, 0x50, 0},      // STAT_AE_SIZE_PERCENT
+	{0x8404, 0x06, 0},      // SEQ_CMD
+#if 0
+	{0x098E, 0xB820, 1},	// LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_0_IMAGE_WIDTH]
+	{0xB820, 0x00, 0}, 	// STAT_AE_WINDOW_POS_X
+	{0xB821, 0x00, 0}, 	// STAT_AE_WINDOW_POS_Y
+	{0xB822, 0xFE, 0}, 	// STAT_AE_WINDOW_SIZE_X
+	{0xB823, 0xEF, 0}, 	// STAT_AE_WINDOW_SIZE_Y
+	{0x8404, 0x06, 0},	// SEQ_CMD
+#endif
+
+};
+
+#if 0
+struct mt9p111_reg_cfg 	mt9p111_analog_control2[]=
+{
+	{0x098E, 0xB820, 1},	// LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_0_IMAGE_WIDTH]
+	{0xB820, 0x30, 0}, 	// STAT_AE_WINDOW_POS_X
+	{0xB821, 0x40, 0}, 	// STAT_AE_WINDOW_POS_Y
+	{0xB822, 0xa0, 0}, 	// STAT_AE_WINDOW_SIZE_X
+	{0xB823, 0x90, 0}, 	// STAT_AE_WINDOW_SIZE_Y
+	{0x8404, 0x06, 0},	// SEQ_CMD
+
+};
+#endif
+
+struct mt9p111_reg_cfg 	mt9p111_lens_infinity[]=
+{
+	//;Lens infinity
+	{0x3170, 0x2096, 1},
+	{0x8419, 0x01, 0}, 	// SEQ_STATE_CFG_1_AF
+	{0xB007, 0x00, 0}, 	// AF_BEST_LENS_POS
+	{0x8404, 0x05, 0}, 	// SEQ_CMD
+};
+
+struct mt9p111_reg_cfg 	mt9p111_capture_power[]=
+{
+//	{0x3EDA, 0x6060, 1}, 	// DAC_LD_14_15
+	{0x098E, 0x843C, 1}, 	// LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_5_MAX_FRAME_CNT]
+	{0x843C, 0xFF, 0}, 	// SEQ_STATE_CFG_5_MAX_FRAME_CNT
+	{0x8404, 0x02, 0}, 	// SEQ_CMD
+};
+
+struct mt9p111_reg_cfg 	mt9p111_capture_power_post[]=
+{
+	{0x3170, 0x205C, 1}, 	// ANALOG_CONTROL
+	{0x8404, 0x05, 0}, 	// SEQ_CMD
+};
+
+struct mt9p111_reg_cfg 	mt9p111_capture_power_post2[]=
+{
+	{0x098E, 0xB828, 1},    // LOGICAL_ADDRESS_ACCESS [STAT_AE_SIZE_PERCENT]
+	{0xB828, 0x50, 0},      // STAT_AE_SIZE_PERCENT
+	{0x8404, 0x06, 0},      // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg 	mt9p111_set_fix_preview_7fps[]=
+{
+	{0x098E, 0x485C, 1},    //  LOGICAL_ADDRESS_ACCESS
+	{0xC85C, 0x0BE0, 1},    // CAM_CORE_A_MIN_FRAME_LENGTH_LINES
+	{0xA818, 0x0BE0, 1},    // AE_TRACK_TARGET_INT_TIME_ROWS
+	{0xA81A, 0x0BE0, 1},    // AE_TRACK_MAX_INT_TIME_ROWS
+	{0x8404, 0x06, 0},      // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg 	mt9p111_set_fix_preview_15fps[]=
+{
+	{0x098E, 0x485C, 1},    //  LOGICAL_ADDRESS_ACCESS
+	{0xC85C, 0x0588, 1},    // CAM_CORE_A_MIN_FRAME_LENGTH_LINES
+	{0xA818, 0x0588, 1},    // AE_TRACK_TARGET_INT_TIME_ROWS
+	{0xA81A, 0x0588, 1},    // AE_TRACK_MAX_INT_TIME_ROWS
+	{0x8404, 0x06, 0},      // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg 	mt9p111_set_fix_preview_20fps[]=
+{
+	{0x098E, 0x485C, 1},    //  LOGICAL_ADDRESS_ACCESS
+	{0xC85C, 0x0423, 1},    // CAM_CORE_A_MIN_FRAME_LENGTH_LINES
+	{0xA818, 0x0423, 1},    // AE_TRACK_TARGET_INT_TIME_ROWS
+	{0xA81A, 0x0423, 1},    // AE_TRACK_MAX_INT_TIME_ROWS
+	{0x8404, 0x06, 0},      // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg 	mt9p111_set_variable_fps_preview[]=
+{
+	{0x098E, 0x485C, 1},    //  LOGICAL_ADDRESS_ACCESS
+	{0xC85C, 0x0423, 1},    // CAM_CORE_A_MIN_FRAME_LENGTH_LINES
+	{0xA818, 0x04D8, 1},    // AE_TRACK_TARGET_INT_TIME_ROWS
+	{0xA818, 0x0420, 1},    // AE_TRACK_TARGET_INT_TIME_ROWS
+	{0xA81A, 0x0C00, 1},    // AE_TRACK_MAX_INT_TIME_ROWS
+	{0x8404, 0x06, 0},      // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_capture_resolution_2592x1944[]=
+{
+	{0x098E, 0x48C0, 1}, // LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_1_IMAGE_WIDTH]
+	{0xC8C0, 0x0A20, 1}, // CAM_OUTPUT_1_IMAGE_WIDTH
+#if 0
+	{0xC8C2, 0x0798, 1}, // CAM_OUTPUT_1_IMAGE_HEIGHT 0x0798, just test liujianhua
+#else
+	{0xC8C2, 0x0799, 1}, // CAM_OUTPUT_1_IMAGE_HEIGHT 0x0798, just test liujianhua,shanghai ewada cut top green line
+#endif
+	{0x3EDA, 0x6060, 1}, // DAC_LD_14_15
+	{0x098E, 0x843C, 1}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_5_MAX_FRAME_CNT]
+	{0x843C, 0xFF, 0},   // SEQ_STATE_CFG_5_MAX_FRAME_CNT
+	{0x8404, 0x02, 0},   // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_capture_resolution_2048x1536[]=
+{
+	{0x098E, 0x48C0, 1}, // LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_1_IMAGE_WIDTH]
+	{0xC8C0, 0x0800, 1}, // CAM_OUTPUT_1_IMAGE_WIDTH
+#if 0
+	{0xC8C2, 0x0600, 1}, // CAM_OUTPUT_1_IMAGE_HEIGHT
+#else
+	{0xC8C2, 0x0602, 1}, // CAM_OUTPUT_1_IMAGE_HEIGHT, shanghai ewada cut top green line
+#endif
+	{0x3EDA, 0x6060, 1}, // DAC_LD_14_15
+	{0x098E, 0x843C, 1}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_5_MAX_FRAME_CNT]
+	{0x843C, 0xFF, 0},   // SEQ_STATE_CFG_5_MAX_FRAME_CNT
+	{0x8404, 0x02, 0},   // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_capture_resolution_1600x1200[]=
+{
+	{0x098E, 0x48C0, 1}, // LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_1_IMAGE_WIDTH]
+	{0xC8C0, 0x0640, 1}, // CAM_OUTPUT_1_IMAGE_WIDTH
+#if 0
+	{0xC8C2, 0x04B0, 1}, // CAM_OUTPUT_1_IMAGE_HEIGHT
+#else
+	{0xC8C2, 0x04B2, 1}, // CAM_OUTPUT_1_IMAGE_HEIGHT, shanghai ewada cut top green line
+#endif
+	{0x3EDA, 0x6060, 1}, // DAC_LD_14_15
+	{0x098E, 0x843C, 1}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_5_MAX_FRAME_CNT]
+	{0x843C, 0xFF, 0},   // SEQ_STATE_CFG_5_MAX_FRAME_CNT
+	{0x8404, 0x02, 0},   // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_capture_resolution_1296x972[]=
+{
+	{0x098E, 0x48C0, 1}, // LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_1_IMAGE_WIDTH]
+	{0xC8C0, 0x0510, 1}, // CAM_OUTPUT_1_IMAGE_WIDTH
+#if 0
+	{0xC8C2, 0x03CC, 1}, // CAM_OUTPUT_1_IMAGE_HEIGHT
+#else
+	{0xC8C2, 0x03CE, 1}, // CAM_OUTPUT_1_IMAGE_HEIGHT , shanghai ewada cut top green line
+#endif
+	{0x3EDA, 0x6060, 1}, // DAC_LD_14_15
+	{0x098E, 0x843C, 1}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_5_MAX_FRAME_CNT]
+	{0x843C, 0xFF, 0},   // SEQ_STATE_CFG_5_MAX_FRAME_CNT
+	{0x8404, 0x02, 0},   // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_capture_resolution_1280x960[]=
+{
+	{0x098E, 0x48C0, 1}, // LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_1_IMAGE_WIDTH]
+	{0xC8C0, 0x0500, 1}, // CAM_OUTPUT_1_IMAGE_WIDTH
+#if 0
+	{0xC8C2, 0x03C0, 1}, // CAM_OUTPUT_1_IMAGE_HEIGHT
+#else
+	{0xC8C2, 0x03C2, 1}, // CAM_OUTPUT_1_IMAGE_HEIGHT,  shanghai ewada cut top green line
+#endif
+	{0x3EDA, 0x6060, 1}, // DAC_LD_14_15
+	{0x098E, 0x843C, 1}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_5_MAX_FRAME_CNT]
+	{0x843C, 0xFF, 0},   // SEQ_STATE_CFG_5_MAX_FRAME_CNT
+	{0x8404, 0x02, 0},   // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_capture_resolution_1280x720[]=
+{
+	{0x098E, 0x48C0, 1}, // LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_1_IMAGE_WIDTH]
+	{0xC8C0, 0x0500, 1}, // CAM_OUTPUT_1_IMAGE_WIDTH
+#if 0
+	{0xC8C2, 0x02D0, 1}, // CAM_OUTPUT_1_IMAGE_HEIGHT
+#else
+	{0xC8C2, 0x02D2, 1}, // CAM_OUTPUT_1_IMAGE_HEIGHT, shanghai ewada cut top green line
+#endif
+	{0x3EDA, 0x6060, 1}, // DAC_LD_14_15
+	{0x098E, 0x843C, 1}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_5_MAX_FRAME_CNT]
+	{0x843C, 0xFF, 0},   // SEQ_STATE_CFG_5_MAX_FRAME_CNT
+	{0x8404, 0x02, 0},   // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_capture_resolution_1024x768[]=
+{
+	{0x098E, 0x48C0, 1}, // LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_1_IMAGE_WIDTH]
+	{0xC8C0, 0x0400, 1}, // CAM_OUTPUT_1_IMAGE_WIDTH
+#if 0
+	{0xC8C2, 0x0300, 1}, // CAM_OUTPUT_1_IMAGE_HEIGHT
+#else
+	{0xC8C2, 0x0302, 1}, // CAM_OUTPUT_1_IMAGE_HEIGHT, shanghai ewada cut top green line
+#endif
+	{0x3EDA, 0x6060, 1}, // DAC_LD_14_15
+	{0x098E, 0x843C, 1}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_5_MAX_FRAME_CNT]
+	{0x843C, 0xFF, 0},   // SEQ_STATE_CFG_5_MAX_FRAME_CNT
+	{0x8404, 0x02, 0},   // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_capture_resolution_800x600[]=
+{
+	{0x098E, 0x48C0, 1}, // LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_1_IMAGE_WIDTH]
+	{0xC8C0, 0x0320, 1}, // CAM_OUTPUT_1_IMAGE_WIDTH
+#if 0
+	{0xC8C2, 0x0258, 1}, // CAM_OUTPUT_1_IMAGE_HEIGHT
+#else
+	{0xC8C2, 0x025A, 1}, // CAM_OUTPUT_1_IMAGE_HEIGHT,shanghai ewada cut top green line
+#endif
+	{0x3EDA, 0x6060, 1}, // DAC_LD_14_15
+	{0x098E, 0x843C, 1}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_5_MAX_FRAME_CNT]
+	{0x843C, 0xFF, 0},   // SEQ_STATE_CFG_5_MAX_FRAME_CNT
+	{0x8404, 0x02, 0},   // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_capture_resolution_640x480[]=
+{
+	{0x098E, 0x48C0, 1}, // LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_1_IMAGE_WIDTH]
+	{0xC8C0, 0x0280, 1}, // CAM_OUTPUT_1_IMAGE_WIDTH
+#if 0
+	{0xC8C2, 0x01E0, 1}, // CAM_OUTPUT_1_IMAGE_HEIGHT
+#else
+	{0xC8C2, 0x01E2, 1}, // CAM_OUTPUT_1_IMAGE_HEIGHT, shanghai ewada cut top green line
+#endif
+	{0x3EDA, 0x6060, 1}, // DAC_LD_14_15
+	{0x098E, 0x843C, 1}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_5_MAX_FRAME_CNT]
+	{0x843C, 0xFF, 0},   // SEQ_STATE_CFG_5_MAX_FRAME_CNT
+	{0x8404, 0x02, 0},   // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_capture_resolution_512x384[]=
+{
+	{0x098E, 0x48C0, 1}, // LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_1_IMAGE_WIDTH]
+	{0xC8C0, 0x0200, 1}, // CAM_OUTPUT_1_IMAGE_WIDTH
+#if 0
+	{0xC8C2, 0x0180, 1}, // CAM_OUTPUT_1_IMAGE_HEIGHT
+#else
+	{0xC8C2, 0x0182, 1}, // CAM_OUTPUT_1_IMAGE_HEIGHT, shanghai ewada cut top green line
+#endif
+	{0x3EDA, 0x6060, 1}, // DAC_LD_14_15
+	{0x098E, 0x843C, 1}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_5_MAX_FRAME_CNT]
+	{0x843C, 0xFF, 0},   // SEQ_STATE_CFG_5_MAX_FRAME_CNT
+	{0x8404, 0x02, 0},   // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_capture_resolution_400x300[]=
+{
+	{0x098E, 0x48C0, 1}, // LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_1_IMAGE_WIDTH]
+	{0xC8C0, 0x0190, 1}, // CAM_OUTPUT_1_IMAGE_WIDTH
+#if 0
+	{0xC8C2, 0x012C, 1}, // CAM_OUTPUT_1_IMAGE_HEIGHT
+#else
+	{0xC8C2, 0x012E, 1}, // CAM_OUTPUT_1_IMAGE_HEIGHT,  shanghai ewada cut top green line
+#endif
+	{0x3EDA, 0x6060, 1}, // DAC_LD_14_15
+	{0x098E, 0x843C, 1}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_5_MAX_FRAME_CNT]
+	{0x843C, 0xFF, 0},   // SEQ_STATE_CFG_5_MAX_FRAME_CNT
+	{0x8404, 0x02, 0},   // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_bright_reduce2[]=
+{
+	{0x098E, 0x5C52, 1}, // LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_1_IMAGE_WIDTH]
+	{0xDC52, 0x00BF, 1}, // SYS_RESERVED1
+};
+
+struct mt9p111_reg_cfg mt9p111_bright_reduce1_5[]=
+{
+	{0x098E, 0x5C52, 1}, // LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_1_IMAGE_WIDTH]
+	{0xDC52, 0x00CF, 1}, // SYS_RESERVED1
+};
+
+struct mt9p111_reg_cfg mt9p111_bright_reduce1[]=
+{
+	{0x098E, 0x5C52, 1}, // LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_1_IMAGE_WIDTH]
+	{0xDC52, 0x00DF, 1}, // SYS_RESERVED1
+};
+
+struct mt9p111_reg_cfg mt9p111_bright_reduce0_5[]=
+{
+	{0x098E, 0x5C52, 1}, // LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_1_IMAGE_WIDTH]
+	{0xDC52, 0x00EF, 1}, // SYS_RESERVED1
+};
+
+struct mt9p111_reg_cfg mt9p111_bright_0[]=
+{
+	{0x098E, 0x5C52, 1}, // LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_1_IMAGE_WIDTH]
+	{0xDC52, 0x0000, 1}, // SYS_RESERVED1
+};
+
+struct mt9p111_reg_cfg mt9p111_bright_increase0_5[]=
+{
+	{0x098E, 0x5C52, 1}, // LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_1_IMAGE_WIDTH]
+	{0xDC52, 0x0010, 1}, // SYS_RESERVED1
+};
+
+struct mt9p111_reg_cfg mt9p111_bright_increase1[]=
+{
+	{0x098E, 0x5C52, 1}, // LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_1_IMAGE_WIDTH]
+	{0xDC52, 0x0020, 1}, // SYS_RESERVED1
+};
+
+struct mt9p111_reg_cfg mt9p111_bright_increase1_5[]=
+{
+	{0x098E, 0x5C52, 1}, // LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_1_IMAGE_WIDTH]
+	{0xDC52, 0x0030, 1}, // SYS_RESERVED1
+};
+
+struct mt9p111_reg_cfg mt9p111_bright_increase2[]=
+{
+	{0x098E, 0x5C52, 1}, // LOGICAL_ADDRESS_ACCESS [CAM_OUTPUT_1_IMAGE_WIDTH]
+	{0xDC52, 0x0040, 1}, // SYS_RESERVED1
+};
+
+struct mt9p111_reg_cfg af_full_scan_mode[]=
+{
+	{0xC400, 0x88, 0}, // AFM_ALGO
+	{0xB002, 0x0380, 1}, // AF_MODE
+	{0xB004, 0x0002, 1}, // AF_ALGO [Full_Scan]
+	{0x8419, 0x05, 0}, // SEQ_STATE_CFG_1_AF [Full_Scan_mode]
+	// full scan
+	{0xC40A, 0x0000, 1}, // AFM_POS_MIN
+	{0xC40C, 0x00E0, 1}, // AFM_POS_MAX
+	// AF Window Resize
+	{0xB854, 0x20, 0}, // STAT_SM_WINDOW_POS_X
+	{0xB855, 0x20, 0}, // STAT_SM_WINDOW_POS_Y
+	{0xB856, 0xBF, 0}, // STAT_SM_WINDOW_SIZE_X
+	{0xB857, 0xBF, 0}, // STAT_SM_WINDOW_SIZE_Y
+	{0xB045, 0x0015, 1}, // AF_MODE_EX
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg af_continuous_mode_1[]=
+{
+	{0x098E, 0x8419, 1}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_1_AF]
+	{0x8419, 0x01, 0}, // SEQ_STATE_CFG_1_AF
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg af_continuous_mode_2[]=
+{
+	{0xC400, 0x88, 0}, // AFM_ALGO
+	{0xB002, 0x0002, 1}, // AF_MODE
+	{0xB004, 0x0010, 1}, // AF_ALGO [Continuous_mode]
+	{0x8419, 0x03, 0}, // SEQ_STATE_CFG_1_AF [AF_Continuous_mode]
+	// continuous
+	{0xC40A, 0x0010, 1}, //0A//000A	// AFM_POS_MIN [16]
+	{0xC40C, 0x00C0, 1}, //C8//00C8 	// AFM_POS_MAX [192]
+	// AF Window Resize
+	{0xB854, 0x52, 0}, // STAT_SM_WINDOW_POS_X
+	{0xB855, 0x58, 0}, // STAT_SM_WINDOW_POS_Y
+	{0xB856, 0x5D, 0}, // STAT_SM_WINDOW_SIZE_X
+	{0xB857, 0x5A, 0}, // STAT_SM_WINDOW_SIZE_Y
+	{0xB045, 0x0014, 1}, // AF_MODE_EX
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg af_continuous_mode_3[]=
+{
+	{0xB006, 0x01, 0}, // AF_PROGRESS
+};
+
+struct mt9p111_reg_cfg mt9p111_full_scan_auto_focus_execution_1[]=
+{
+	{0x098E, 0x8419, 1}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_1_AF]
+	{0x8419, 0x05, 0}, // SEQ_STATE_CFG_1_AF
+	{0x8404, 0x05, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_full_scan_auto_focus_execution_2[]=
+{
+	{0x098E, 0x8419, 1}, // LOGICAL_ADDRESS_ACCESS [AF_PROGRESS]
+	{0xB006, 0x01, 0}, // AF_PROGRESS
+};
+
+struct mt9p111_reg_cfg mt9t111_default_af_area[]=
+{
+	{0x098E, 0xB854, 1}, // LOGICAL_ADDRESS_ACCESS [STAT_SM_WINDOW_POS_X]
+	{0xB854, 0x20, 0}, // STAT_SM_WINDOW_POS_X
+	{0xB855, 0x20, 0}, // STAT_SM_WINDOW_POS_Y
+	{0xB856, 0xBF, 0}, // STAT_SM_WINDOW_SIZE_X
+	{0xB857, 0xBF, 0}, // STAT_SM_WINDOW_SIZE_Y
+	{0x8404, 0x05, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_sf_up_left[]=
+{
+	{0x098E, 0xB854, 1}, // LOGICAL_ADDRESS_ACCESS [STAT_SM_WINDOW_POS_X]
+	{0xB854, 0x00, 0}, // STAT_SM_WINDOW_POS_X
+	{0xB855, 0x00, 0}, // STAT_SM_WINDOW_POS_Y
+	{0xB856, 0x55, 0}, // STAT_SM_WINDOW_SIZE_X
+	{0xB857, 0x55, 0}, // STAT_SM_WINDOW_SIZE_Y
+	{0x8404, 0x05, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_sf_up_mid[]=
+{
+	{0x098E, 0xB854, 1}, // LOGICAL_ADDRESS_ACCESS [STAT_SM_WINDOW_POS_X]
+	{0xB854, 0x56, 0}, // STAT_SM_WINDOW_POS_X
+	{0xB855, 0x00, 0}, // STAT_SM_WINDOW_POS_Y
+	{0xB856, 0x55, 0}, // STAT_SM_WINDOW_SIZE_X
+	{0xB857, 0x55, 0}, // STAT_SM_WINDOW_SIZE_Y
+	{0x8404, 0x05, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_sf_up_right[]=
+{
+	{0x098E, 0xB854, 1}, // LOGICAL_ADDRESS_ACCESS [STAT_SM_WINDOW_POS_X]
+	{0xB854, 0xAC, 0}, // STAT_SM_WINDOW_POS_X
+	{0xB855, 0x00, 0}, // STAT_SM_WINDOW_POS_Y
+	{0xB856, 0x55, 0}, // STAT_SM_WINDOW_SIZE_X
+	{0xB857, 0x55, 0}, // STAT_SM_WINDOW_SIZE_Y
+	{0x8404, 0x05, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_sf_mid_left[]=
+{
+	{0x098E, 0xB854, 1}, // LOGICAL_ADDRESS_ACCESS [STAT_SM_WINDOW_POS_X]
+	{0xB854, 0x00, 0}, // STAT_SM_WINDOW_POS_X
+	{0xB855, 0x56, 0}, // STAT_SM_WINDOW_POS_Y
+	{0xB856, 0x55, 0}, // STAT_SM_WINDOW_SIZE_X
+	{0xB857, 0x55, 0}, // STAT_SM_WINDOW_SIZE_Y
+	{0x8404, 0x05, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_sf_mid_mid[]=
+{
+	{0x098E, 0xB854, 1}, // LOGICAL_ADDRESS_ACCESS [STAT_SM_WINDOW_POS_X]
+	{0xB854, 0x56, 0}, // STAT_SM_WINDOW_POS_X
+	{0xB855, 0x56, 0}, // STAT_SM_WINDOW_POS_Y
+	{0xB856, 0x55, 0}, // STAT_SM_WINDOW_SIZE_X
+	{0xB857, 0x55, 0}, // STAT_SM_WINDOW_SIZE_Y
+	{0x8404, 0x05, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_sf_mid_right[]=
+{
+	{0x098E, 0xB854, 1}, // LOGICAL_ADDRESS_ACCESS [STAT_SM_WINDOW_POS_X]
+	{0xB854, 0xAC, 0}, // STAT_SM_WINDOW_POS_X
+	{0xB855, 0x56, 0}, // STAT_SM_WINDOW_POS_Y
+	{0xB856, 0x55, 0}, // STAT_SM_WINDOW_SIZE_X
+	{0xB857, 0x55, 0}, // STAT_SM_WINDOW_SIZE_Y
+	{0x8404, 0x05, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_sf_down_left[]=
+{
+	{0x098E, 0xB854, 1}, // LOGICAL_ADDRESS_ACCESS [STAT_SM_WINDOW_POS_X]
+	{0xB854, 0x00, 0}, // STAT_SM_WINDOW_POS_X
+	{0xB855, 0xAC, 0}, // STAT_SM_WINDOW_POS_Y
+	{0xB856, 0x55, 0}, // STAT_SM_WINDOW_SIZE_X
+	{0xB857, 0x55, 0}, // STAT_SM_WINDOW_SIZE_Y
+	{0x8404, 0x05, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_sf_down_mid[]=
+{
+	{0x098E, 0xB854, 1}, // LOGICAL_ADDRESS_ACCESS [STAT_SM_WINDOW_POS_X]
+	{0xB854, 0x56, 0}, // STAT_SM_WINDOW_POS_X
+	{0xB855, 0xAC, 0}, // STAT_SM_WINDOW_POS_Y
+	{0xB856, 0x55, 0}, // STAT_SM_WINDOW_SIZE_X
+	{0xB857, 0x55, 0}, // STAT_SM_WINDOW_SIZE_Y
+	{0x8404, 0x05, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_sf_down_right[]=
+{
+	{0x098E, 0xB854, 1}, // LOGICAL_ADDRESS_ACCESS [STAT_SM_WINDOW_POS_X]
+	{0xB854, 0xAC, 0}, // STAT_SM_WINDOW_POS_X
+	{0xB855, 0xAC, 0}, // STAT_SM_WINDOW_POS_Y
+	{0xB856, 0x55, 0}, // STAT_SM_WINDOW_SIZE_X
+	{0xB857, 0x55, 0}, // STAT_SM_WINDOW_SIZE_Y
+	{0x8404, 0x05, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_manual_focus_1[]=
+{
+	{0x098E, 0xB007, 1}, // LOGICAL_ADDRESS_ACCESS [AF_BEST_LENS_POS]
+	{0xB007, 0xE6, 0}, // AF_BEST_LENS_POS
+};
+
+struct mt9p111_reg_cfg mt9p111_manual_focus_2[]=
+{
+	{0x098E, 0xB007, 1}, // LOGICAL_ADDRESS_ACCESS [AF_BEST_LENS_POS]
+	{0xB007, 0xD2, 0}, // AF_BEST_LENS_POS
+};
+
+struct mt9p111_reg_cfg mt9p111_manual_focus_3[]=
+{
+	{0x098E, 0xB007, 1}, // LOGICAL_ADDRESS_ACCESS [AF_BEST_LENS_POS]
+	{0xB007, 0xBE, 0}, // AF_BEST_LENS_POS
+};
+
+struct mt9p111_reg_cfg mt9p111_manual_focus_4[]=
+{
+	{0x098E, 0xB007, 1}, // LOGICAL_ADDRESS_ACCESS [AF_BEST_LENS_POS]
+	{0xB007, 0xAA, 0}, // AF_BEST_LENS_POS
+};
+
+struct mt9p111_reg_cfg mt9p111_manual_focus_5[]=
+{
+	{0x098E, 0xB007, 1}, // LOGICAL_ADDRESS_ACCESS [AF_BEST_LENS_POS]
+	{0xB007, 0x96, 0}, // AF_BEST_LENS_POS
+};
+
+struct mt9p111_reg_cfg mt9p111_manual_focus_6[]=
+{
+	{0x098E, 0xB007, 1}, // LOGICAL_ADDRESS_ACCESS [AF_BEST_LENS_POS]
+	{0xB007, 0x82, 0}, // AF_BEST_LENS_POS
+};
+
+struct mt9p111_reg_cfg mt9p111_manual_focus_7[]=
+{
+	{0x098E, 0xB007, 1}, // LOGICAL_ADDRESS_ACCESS [AF_BEST_LENS_POS]
+	{0xB007, 0x6E, 0}, // AF_BEST_LENS_POS
+};
+
+struct mt9p111_reg_cfg mt9p111_manual_focus_8[]=
+{
+	{0x098E, 0xB007, 1}, // LOGICAL_ADDRESS_ACCESS [AF_BEST_LENS_POS]
+	{0xB007, 0x5A, 0}, // AF_BEST_LENS_POS
+};
+
+struct mt9p111_reg_cfg mt9p111_manual_focus_9[]=
+{
+	{0x098E, 0xB007, 1}, // LOGICAL_ADDRESS_ACCESS [AF_BEST_LENS_POS]
+	{0xB007, 0x2D, 0}, // AF_BEST_LENS_POS
+};
+
+struct mt9p111_reg_cfg mt9p111_manual_focus_10[]=
+{
+	{0x098E, 0xB007, 1}, // LOGICAL_ADDRESS_ACCESS [AF_BEST_LENS_POS]
+	{0xB007, 0x00, 0}, // AF_BEST_LENS_POS
+};
+
+struct mt9p111_reg_cfg mt9p111_wb_auto_1[]=
+{
+	{0x098E, 0xAC01, 1}, // LOGICAL_ADDRESS_ACCESS [AWB_MODE]
+	{0xAC01, 0xEF, 0}, // AWB_MODE
+	{0x098E, 0x8410, 1}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_0_AWB]
+	{0x8410, 0x02, 0}, // SEQ_STATE_CFG_0_AWB
+	{0x8418, 0x02, 0}, // SEQ_STATE_CFG_1_AWB
+	{0x8420, 0x02, 0}, // SEQ_STATE_CFG_2_AWB
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_wb_auto_2[]=
+{
+	{0xAC44, 0x00, 0}, // AWB_LEFT_CCM_POS_RANGE_LIMIT
+	{0xAC45, 0x7F, 0}, // AWB_RIGHT_CCM_POS_RANGE_LIMIT
+	{0x8404, 0x05, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_wb_cloudy_1[]=
+{
+	{0x098E, 0x8410, 1}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_0_AWB]
+	{0x8410, 0x01, 0}, // SEQ_STATE_CFG_0_AWB
+	{0x8418, 0x01, 0}, // SEQ_STATE_CFG_1_AWB
+	{0x8420, 0x01, 0}, // SEQ_STATE_CFG_2_AWB
+	{0xAC44, 0x7F, 0}, // AWB_LEFT_CCM_POS_RANGE_LIMIT
+	{0xAC45, 0x7F, 0}, // AWB_RIGHT_CCM_POS_RANGE_LIMIT
+	{0xAC08, 0x7F, 0}, // AWB_CUR_CCM_POS
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_wb_cloudy_2[]=
+{
+	{0xAC04, 0x3A, 0}, // AWB_PRE_AWB_R2G_RATIO
+	{0xAC05, 0x50, 0}, // AWB_PRE_AWB_B2G_RATIO
+	{0x8404, 0x05, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_wb_daylight_1[]=
+{
+	{0x098E, 0x8410, 1}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_0_AWB]
+	{0x8410, 0x01, 0}, // SEQ_STATE_CFG_0_AWB
+	{0x8418, 0x01, 0}, // SEQ_STATE_CFG_1_AWB
+	{0x8420, 0x01, 0}, // SEQ_STATE_CFG_2_AWB
+	{0xAC44, 0x7F, 0}, // AWB_LEFT_CCM_POS_RANGE_LIMIT
+	{0xAC45, 0x7F, 0}, // AWB_RIGHT_CCM_POS_RANGE_LIMIT
+	{0xAC08, 0x7F, 0}, // AWB_CUR_CCM_POS
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_wb_daylight_2[]=
+{
+	{0xAC04, 0x3F, 0}, // AWB_PRE_AWB_R2G_RATIO
+	{0xAC05, 0x49, 0}, // AWB_PRE_AWB_B2G_RATIO
+	{0x8404, 0x05, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_wb_fluorescent_1[]=
+{
+	{0x098E, 0x8410, 1}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_0_AWB]
+	{0x8410, 0x01, 0}, // SEQ_STATE_CFG_0_AWB
+	{0x8418, 0x01, 0}, // SEQ_STATE_CFG_1_AWB
+	{0x8420, 0x01, 0}, // SEQ_STATE_CFG_2_AWB
+	{0xAC44, 0x40, 0}, // AWB_LEFT_CCM_POS_RANGE_LIMIT
+	{0xAC45, 0x40, 0}, // AWB_RIGHT_CCM_POS_RANGE_LIMIT
+	{0xAC08, 0x40, 0}, // AWB_CUR_CCM_POS
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_wb_fluorescent_2[]=
+{
+	{0xAC04, 0x40, 0}, // AWB_PRE_AWB_R2G_RATIO
+	{0xAC05, 0x34, 0}, // AWB_PRE_AWB_B2G_RATIO
+	{0x8404, 0x05, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_wb_incandescent_1[]=
+{
+	{0x098E, 0x8410, 1}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_0_AWB]
+	{0x8410, 0x01, 0}, // SEQ_STATE_CFG_0_AWB
+	{0x8418, 0x01, 0}, // SEQ_STATE_CFG_1_AWB
+	{0x8420, 0x01, 0}, // SEQ_STATE_CFG_2_AWB
+	{0xAC44, 0x00, 0}, // AWB_LEFT_CCM_POS_RANGE_LIMIT
+	{0xAC45, 0x00, 0}, // AWB_RIGHT_CCM_POS_RANGE_LIMIT
+	{0xAC08, 0x00, 0}, // AWB_CUR_CCM_POS
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_wb_incandescent_2[]=
+{
+	{0xAC04, 0x52, 0}, // AWB_PRE_AWB_R2G_RATIO
+	{0xAC05, 0x2E, 0}, // AWB_PRE_AWB_B2G_RATIO
+	{0x8404, 0x05, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_effect_none[]=
+{
+	{0x098E, 0xDC38, 1}, // LOGICAL_ADDRESS_ACCESS [SYS_SELECT_FX]
+	{0xDC38, 0x00, 0}, // SYS_SELECT_FX
+	{0xDC02, 0x002E, 1}, // SYS_ALGO
+	{0xDC39, 0x00, 0}, // SYS_SOLARIZATION_TH
+	{0xDC3A, 0x23, 0}, // SYS_SEPIA_CR
+	{0xDC3B, 0xB2, 0}, // SYS_SEPIA_CB
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_effect_gray[]=
+{
+	{0x098E, 0xDC38, 1}, // LOGICAL_ADDRESS_ACCESS [SYS_SELECT_FX]
+	{0xDC38, 0x01, 0}, // SYS_SELECT_FX
+	{0xDC02, 0x006E, 1}, // SYS_ALGO
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_effect_sepia[]=
+{
+	{0x098E, 0xDC38, 1}, // LOGICAL_ADDRESS_ACCESS [SYS_SELECT_FX]
+	{0xDC38, 0x02, 0}, // SYS_SELECT_FX
+	{0xDC02, 0x006E, 1}, // SYS_ALGO
+	{0xDC3A, 0x23, 0}, // SYS_SEPIA_CR
+	{0xDC3B, 0xB2, 0}, // SYS_SEPIA_CB
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_effect_negative[]=
+{
+	{0x098E, 0xDC38, 1}, // LOGICAL_ADDRESS_ACCESS [SYS_SELECT_FX]
+	{0xDC38, 0x03, 0}, // SYS_SELECT_FX
+	{0xDC02, 0x006E, 1}, // SYS_ALGO
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_effect_solarize[]=
+{
+	{0x098E, 0xDC38, 1}, // LOGICAL_ADDRESS_ACCESS [SYS_SELECT_FX]
+	{0xDC38, 0x04, 0}, // SYS_SELECT_FX
+	{0xDC02, 0x006E, 1}, // SYS_ALGO
+	{0xDC39, 0x00, 0}, // SYS_SOLARIZATION_TH
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+
+struct mt9p111_reg_cfg mt9p111_snapshot_mode[]=
+{
+	{0x098E, 0x485C, 1}, // LOGICAL_ADDRESS_ACCESS
+	{0xC85C, 0x0423, 1}, // CAM_CORE_A_MIN_FRAME_LENGTH_LINES
+	{0xA818, 0x04D8, 1}, // AE_TRACK_TARGET_INT_TIME_ROWS
+	{0xA818, 0x0420, 1}, // AE_TRACK_TARGET_INT_TIME_ROWS
+	{0xA81A, 0x0C00, 1}, // AE_TRACK_MAX_INT_TIME_ROWS
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_movie_mode[]=
+{
+	{0x098E, 0x485C, 1}, // LOGICAL_ADDRESS_ACCESS
+	{0xC85C, 0x0423, 1}, // CAM_CORE_A_MIN_FRAME_LENGTH_LINES
+	{0xA818, 0x0423, 1}, // AE_TRACK_TARGET_INT_TIME_ROWS
+	{0xA81A, 0x0423, 1}, // AE_TRACK_MAX_INT_TIME_ROWS
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_reflect_none[]=
+{
+	{0x098E, 0xC850, 1}, // LOGICAL_ADDRESS_ACCESS [CAM_CORE_A_ORIENTATION]
+	{0xC850, 0x00, 0}, // CAM_CORE_A_ORIENTATION
+	{0xC851, 0x00, 0}, // CAM_CORE_A_PIXEL_ORDER
+	{0xC888, 0x00, 0}, // CAM_CORE_B_ORIENTATION
+	{0xC889, 0x00, 0}, // CAM_CORE_B_PIXEL_ORDER
+	{0xC8ED, 0x03, 0}, // CAM_TX_ENABLE_MODE
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_reflect_mirror[]=
+{
+	{0x098E, 0xC850, 1}, // LOGICAL_ADDRESS_ACCESS [CAM_CORE_A_ORIENTATION]
+	{0xC850, 0x01, 0}, // CAM_CORE_A_ORIENTATION
+	{0xC851, 0x01, 0}, // CAM_CORE_A_PIXEL_ORDER
+	{0xC888, 0x01, 0}, // CAM_CORE_B_ORIENTATION
+	{0xC889, 0x01, 0}, // CAM_CORE_B_PIXEL_ORDER
+	{0xC8ED, 0x03, 0}, // CAM_TX_ENABLE_MODE
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_reflect_water[]=
+{
+	{0x098E, 0xC850, 1}, // LOGICAL_ADDRESS_ACCESS [CAM_CORE_A_ORIENTATION]
+	{0xC850, 0x02, 0}, // CAM_CORE_A_ORIENTATION
+	{0xC851, 0x02, 0}, // CAM_CORE_A_PIXEL_ORDER
+	{0xC888, 0x02, 0}, // CAM_CORE_B_ORIENTATION
+	{0xC889, 0x02, 0}, // CAM_CORE_B_PIXEL_ORDER
+	{0xC8ED, 0x02, 0}, // CAM_TX_ENABLE_MODE
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_reflect_mirror_water[]=
+{
+	{0x098E, 0xC850, 1}, // LOGICAL_ADDRESS_ACCESS [CAM_CORE_A_ORIENTATION]
+	{0xC850, 0x03, 0}, // CAM_CORE_A_ORIENTATION
+	{0xC851, 0x03, 0}, // CAM_CORE_A_PIXEL_ORDER
+	{0xC888, 0x03, 0}, // CAM_CORE_B_ORIENTATION
+	{0xC889, 0x03, 0}, // CAM_CORE_B_PIXEL_ORDER
+	{0xC8ED, 0x03, 0}, // CAM_TX_ENABLE_MODE
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_scene[]=
+{
+	{0x098E, 0xAC01, 1}, // LOGICAL_ADDRESS_ACCESS [AWB_MODE]
+	{0xAC01, 0xEF, 0}, // AWB_MODE
+	{0x098E, 0x8410, 1}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_0_AWB]
+	{0x8410, 0x02, 0}, // SEQ_STATE_CFG_0_AWB
+	{0x8418, 0x02, 0}, // SEQ_STATE_CFG_1_AWB
+	{0x8420, 0x02, 0}, // SEQ_STATE_CFG_2_AWB
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_normal[]=
+{
+#if 0
+	{0xAC44, 0x00, 0}, // AWB_LEFT_CCM_POS_RANGE_LIMIT
+	{0xAC45, 0x7F, 0}, // AWB_RIGHT_CCM_POS_RANGE_LIMIT
+#endif
+	// Scene
+	{0x098E, 0xB820, 1}, // LOGICAL_ADDRESS_ACCESS [STAT_AE_WINDOW_POS_X]
+	{0xB820, 0x30, 0}, // STAT_AE_WINDOW_POS_X
+	{0xB821, 0x40, 0}, // STAT_AE_WINDOW_POS_Y
+	{0xB822, 0xa0, 0}, // STAT_AE_WINDOW_SIZE_X
+	{0xB823, 0x90, 0}, // STAT_AE_WINDOW_SIZE_Y
+	{0xA409, 0x3A, 0}, // AE_RULE_BASE_TARGET
+#if 0
+	// Neut Gamma 0.4,balck 5, contrast 1.3
+	{0xBC2B, 0x00, 0}, // LL_GAMMA_NEUTRAL_CURVE_0
+	{0xBC2C, 0x0A, 0}, // LL_GAMMA_NEUTRAL_CURVE_1
+	{0xBC2D, 0x1F, 0}, // LL_GAMMA_NEUTRAL_CURVE_2
+	{0xBC2E, 0x44, 0}, // LL_GAMMA_NEUTRAL_CURVE_3
+	{0xBC2F, 0x6D, 0}, // LL_GAMMA_NEUTRAL_CURVE_4
+	{0xBC30, 0x8E, 0}, // LL_GAMMA_NEUTRAL_CURVE_5
+	{0xBC31, 0xA4, 0}, // LL_GAMMA_NEUTRAL_CURVE_6
+	{0xBC32, 0xB5, 0}, // LL_GAMMA_NEUTRAL_CURVE_7
+	{0xBC33, 0xC2, 0}, // LL_GAMMA_NEUTRAL_CURVE_8
+	{0xBC34, 0xCD, 0}, // LL_GAMMA_NEUTRAL_CURVE_9
+	{0xBC35, 0xD5, 0}, // LL_GAMMA_NEUTRAL_CURVE_10
+	{0xBC36, 0xDD, 0}, // LL_GAMMA_NEUTRAL_CURVE_11
+	{0xBC37, 0xE3, 0}, // LL_GAMMA_NEUTRAL_CURVE_12
+	{0xBC38, 0xE9, 0}, // LL_GAMMA_NEUTRAL_CURVE_13
+	{0xBC39, 0xEE, 0}, // LL_GAMMA_NEUTRAL_CURVE_14
+	{0xBC3A, 0xF3, 0}, // LL_GAMMA_NEUTRAL_CURVE_15
+	{0xBC3B, 0xF7, 0}, // LL_GAMMA_NEUTRAL_CURVE_16
+	{0xBC3C, 0xFB, 0}, // LL_GAMMA_NEUTRAL_CURVE_17
+	{0xBC3D, 0xFF, 0}, // LL_GAMMA_NEUTRAL_CURVE_18    
+#endif
+	// CCM
+	{0xAC46, 0x0233, 1}, // AWB_LEFT_CCM_0
+	{0xAC48, 0xFEDA, 1}, // AWB_LEFT_CCM_1
+	{0xAC4A, 0xFFF2, 1}, // AWB_LEFT_CCM_2
+	{0xAC4C, 0xFF83, 1}, // AWB_LEFT_CCM_3
+	{0xAC4E, 0x019B, 1}, // AWB_LEFT_CCM_4
+	{0xAC50, 0xFFE0, 1}, // AWB_LEFT_CCM_5
+	{0xAC52, 0xFFE6, 1}, // AWB_LEFT_CCM_6
+	{0xAC54, 0xFEBF, 1}, // AWB_LEFT_CCM_7
+	{0xAC56, 0x025C, 1}, // AWB_LEFT_CCM_8
+	{0xAC58, 0x0091, 1}, // AWB_LEFT_CCM_R2BRATIO
+	{0xAC5C, 0x031E, 1}, // AWB_RIGHT_CCM_0
+	{0xAC5E, 0xFE59, 1}, // AWB_RIGHT_CCM_1
+	{0xAC60, 0xFF79, 1}, // AWB_RIGHT_CCM_2
+	{0xAC62, 0xFFE0, 1}, // AWB_RIGHT_CCM_3
+	{0xAC64, 0x0136, 1}, // AWB_RIGHT_CCM_4
+	{0xAC66, 0xFFEE, 1}, // AWB_RIGHT_CCM_5
+	{0xAC68, 0x0007, 1}, // AWB_RIGHT_CCM_6
+	{0xAC6A, 0xFF38, 1}, // AWB_RIGHT_CCM_7
+	{0xAC6C, 0x01BC, 1}, // AWB_RIGHT_CCM_8
+#if 0
+	{0xAC6E, 0x0060, 1}, // AWB_RIGHT_CCM_R2BRATIO
+#endif
+	// manual_RGB_gain
+	{0xAC97, 0x70, 0}, // [LEFE_Red]
+	{0xAC98, 0x7A, 0}, // [LEFE_Green]
+	{0xAC99, 0x84, 0}, // [LEFE_Blue]
+	{0xAC9A, 0x7C, 0}, // [RIGHT_Red]
+	{0xAC9B, 0x80, 0}, // [RIGHT_Green]
+	{0xAC9C, 0x7E, 0}, // [RIGHT_Blue]
+	{0x098E, 0xA807, 1}, // LOGICAL_ADDRESS_ACCESS [AE_TRACK_JUMP_DIVISOR]
+	{0xA807, 0x02, 0}, // AE_TRACK_JUMP_DIVISOR
+	{0xA80A, 0x02, 0}, // AE_TRACK_NUM_FRAMES_TO_SKIP
+	{0xA824, 0x00E6, 1}, // AE_TRACK_MAX_DGAIN
+	{0xC85C, 0x0423, 1}, // CAM_CORE_A_MIN_FRAME_LENGTH_LINES
+	{0xA818, 0x0420, 1}, // AE_TRACK_TARGET_INT_TIME_ROWS
+	{0xA81A, 0x0C00, 1}, // AE_TRACK_MAX_INT_TIME_ROWS
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_portrait[]=
+{
+#if 0
+	{0xAC44, 0x00, 0}, // AWB_LEFT_CCM_POS_RANGE_LIMIT
+	{0xAC45, 0x7F, 0}, // AWB_RIGHT_CCM_POS_RANGE_LIMIT
+#endif
+	// Scene
+	{0x098E, 0xB820, 1}, // LOGICAL_ADDRESS_ACCESS [STAT_AE_WINDOW_POS_X]
+	{0xB820, 0x20, 0}, // STAT_AE_WINDOW_POS_X
+	{0xB821, 0x20, 0}, // STAT_AE_WINDOW_POS_Y
+	{0xB822, 0xDF, 0}, // STAT_AE_WINDOW_SIZE_X
+	{0xB823, 0xCF, 0}, // STAT_AE_WINDOW_SIZE_Y
+	{0xA409, 0x35, 0}, 	// AE_RULE_BASE_TARGET 2011.06.06
+#if 0
+	// Neut Gamma 0.4,balck 5, contrast 1.3
+	{0xBC2B, 0x00, 0}, // LL_GAMMA_NEUTRAL_CURVE_0
+	{0xBC2C, 0x0A, 0}, // LL_GAMMA_NEUTRAL_CURVE_1
+	{0xBC2D, 0x1C, 0}, // LL_GAMMA_NEUTRAL_CURVE_2
+	{0xBC2E, 0x36, 0}, // LL_GAMMA_NEUTRAL_CURVE_3
+	{0xBC2F, 0x56, 0}, // LL_GAMMA_NEUTRAL_CURVE_4
+	{0xBC30, 0x70, 0}, // LL_GAMMA_NEUTRAL_CURVE_5
+	{0xBC31, 0x86, 0}, // LL_GAMMA_NEUTRAL_CURVE_6
+	{0xBC32, 0x99, 0}, // LL_GAMMA_NEUTRAL_CURVE_7
+	{0xBC33, 0xA9, 0}, // LL_GAMMA_NEUTRAL_CURVE_8
+	{0xBC34, 0xB6, 0}, // LL_GAMMA_NEUTRAL_CURVE_9
+	{0xBC35, 0xC1, 0}, // LL_GAMMA_NEUTRAL_CURVE_10
+	{0xBC36, 0xCC, 0}, // LL_GAMMA_NEUTRAL_CURVE_11
+	{0xBC37, 0xD5, 0}, // LL_GAMMA_NEUTRAL_CURVE_12
+	{0xBC38, 0xDE, 0}, // LL_GAMMA_NEUTRAL_CURVE_13
+	{0xBC39, 0xE5, 0}, // LL_GAMMA_NEUTRAL_CURVE_14
+	{0xBC3A, 0xEC, 0}, // LL_GAMMA_NEUTRAL_CURVE_15
+	{0xBC3B, 0xF3, 0}, // LL_GAMMA_NEUTRAL_CURVE_16
+	{0xBC3C, 0xF9, 0}, // LL_GAMMA_NEUTRAL_CURVE_17
+	{0xBC3D, 0xFF, 0}, // LL_GAMMA_NEUTRAL_CURVE_18    
+#endif
+	// CCM
+	{0xAC46, 0x02BD, 1}, // AWB_LEFT_CCM_0
+	{0xAC48, 0xFE51, 1}, // AWB_LEFT_CCM_1
+	{0xAC4A, 0xFFDD, 1}, // AWB_LEFT_CCM_2
+	{0xAC4C, 0xFF92, 1}, // AWB_LEFT_CCM_3
+	{0xAC4E, 0x0152, 1}, // AWB_LEFT_CCM_4
+	{0xAC50, 0x001E, 1}, // AWB_LEFT_CCM_5
+	{0xAC52, 0xFFEF, 1}, // AWB_LEFT_CCM_6
+	{0xAC54, 0xFEEC, 1}, // AWB_LEFT_CCM_7
+	{0xAC56, 0x0226, 1}, // AWB_LEFT_CCM_8
+	{0xAC58, 0x0083, 1}, // AWB_LEFT_CCM_R2BRATIO
+	{0xAC5C, 0x02FA, 1}, // AWB_RIGHT_CCM_0
+	{0xAC5E, 0xFE0E, 1}, // AWB_RIGHT_CCM_1
+	{0xAC60, 0xFFFE, 1}, // AWB_RIGHT_CCM_2
+	{0xAC62, 0xFFA3, 1}, // AWB_RIGHT_CCM_3
+	{0xAC64, 0x010D, 1}, // AWB_RIGHT_CCM_4
+	{0xAC66, 0x0054, 1}, // AWB_RIGHT_CCM_5
+	{0xAC68, 0xFFD7, 1}, // AWB_RIGHT_CCM_6
+	{0xAC6A, 0xFF27, 1}, // AWB_RIGHT_CCM_7
+	{0xAC6C, 0x01FC, 1}, // AWB_RIGHT_CCM_8
+	{0xAC6E, 0x0060, 1}, // AWB_RIGHT_CCM_R2BRATIO
+	// manual_RGB_gain
+	{0xAC97, 0x80, 0}, // [LEFE_Red]
+	{0xAC98, 0x80, 0}, // [LEFE_Green]
+	{0xAC99, 0x70, 0}, // [LEFE_Blue]
+	{0xAC9A, 0x90, 0}, // [RIGHT_Red]
+	{0xAC9B, 0x90, 0}, // [RIGHT_Green]
+	{0xAC9C, 0x70, 0}, // [RIGHT_Blue]
+	{0x098E, 0xA807, 1}, // LOGICAL_ADDRESS_ACCESS [AE_TRACK_JUMP_DIVISOR]
+	{0xA807, 0x02, 0}, // AE_TRACK_JUMP_DIVISOR
+	{0xA80A, 0x02, 0}, // AE_TRACK_NUM_FRAMES_TO_SKIP// ISOÁõ°¡½Ã AE Haunting¹æÁö
+	{0xA824, 0x00E6, 1}, // AE_TRACK_MAX_DGAIN
+	{0xC85C, 0x0423, 1}, // CAM_CORE_A_MIN_FRAME_LENGTH_LINES
+	{0xA818, 0x0420, 1}, // AE_TRACK_TARGET_INT_TIME_ROWS
+	{0xA81A, 0x0C00, 1}, // AE_TRACK_MAX_INT_TIME_ROWS
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_landscape[]=
+{
+#if 0
+	{0xAC44, 0x00, 0}, // AWB_LEFT_CCM_POS_RANGE_LIMIT
+	{0xAC45, 0x7F, 0}, // AWB_RIGHT_CCM_POS_RANGE_LIMIT
+#endif
+	// Scene
+	{0x098E, 0xB820, 1}, // LOGICAL_ADDRESS_ACCESS [STAT_AE_WINDOW_POS_X]
+	{0xB820, 0x30, 0}, // STAT_AE_WINDOW_POS_X
+	{0xB821, 0x40, 0}, // STAT_AE_WINDOW_POS_Y
+	{0xB822, 0xa0, 0}, // STAT_AE_WINDOW_SIZE_X
+	{0xB823, 0x90, 0}, // STAT_AE_WINDOW_SIZE_Y
+	{0xA409, 0x3A, 0}, // AE_RULE_BASE_TARGET
+#if 0
+	// Neut Gamma 0.4,balck 5, contrast 1.3
+	{0xBC2B, 0x00, 0}, // LL_GAMMA_NEUTRAL_CURVE_0
+	{0xBC2C, 0x0A, 0}, // LL_GAMMA_NEUTRAL_CURVE_1
+	{0xBC2D, 0x1C, 0}, // LL_GAMMA_NEUTRAL_CURVE_2
+	{0xBC2E, 0x36, 0}, // LL_GAMMA_NEUTRAL_CURVE_3
+	{0xBC2F, 0x56, 0}, // LL_GAMMA_NEUTRAL_CURVE_4
+	{0xBC30, 0x70, 0}, // LL_GAMMA_NEUTRAL_CURVE_5
+	{0xBC31, 0x86, 0}, // LL_GAMMA_NEUTRAL_CURVE_6
+	{0xBC32, 0x99, 0}, // LL_GAMMA_NEUTRAL_CURVE_7
+	{0xBC33, 0xA9, 0}, // LL_GAMMA_NEUTRAL_CURVE_8
+	{0xBC34, 0xB6, 0}, // LL_GAMMA_NEUTRAL_CURVE_9
+	{0xBC35, 0xC1, 0}, // LL_GAMMA_NEUTRAL_CURVE_10
+	{0xBC36, 0xCC, 0}, // LL_GAMMA_NEUTRAL_CURVE_11
+	{0xBC37, 0xD5, 0}, // LL_GAMMA_NEUTRAL_CURVE_12
+	{0xBC38, 0xDE, 0}, // LL_GAMMA_NEUTRAL_CURVE_13
+	{0xBC39, 0xE5, 0}, // LL_GAMMA_NEUTRAL_CURVE_14
+	{0xBC3A, 0xEC, 0}, // LL_GAMMA_NEUTRAL_CURVE_15
+	{0xBC3B, 0xF3, 0}, // LL_GAMMA_NEUTRAL_CURVE_16
+	{0xBC3C, 0xF9, 0}, // LL_GAMMA_NEUTRAL_CURVE_17
+	{0xBC3D, 0xFF, 0}, // LL_GAMMA_NEUTRAL_CURVE_18    
+#endif
+	// CCM
+	{0xAC46, 0x0338, 1}, // AWB_LEFT_CCM_0
+	{0xAC48, 0xFDF5, 1}, // AWB_LEFT_CCM_1
+	{0xAC4A, 0xFFD3, 1}, // AWB_LEFT_CCM_2
+	{0xAC4C, 0xFF7C, 1}, // AWB_LEFT_CCM_3
+	{0xAC4E, 0x0192, 1}, // AWB_LEFT_CCM_4
+	{0xAC50, 0xFFF2, 1}, // AWB_LEFT_CCM_5
+	{0xAC52, 0xFFCE, 1}, // AWB_LEFT_CCM_6
+	{0xAC54, 0xFEAD, 1}, // AWB_LEFT_CCM_7
+	{0xAC56, 0x0285, 1}, // AWB_LEFT_CCM_8
+	{0xAC58, 0x0083, 1}, // AWB_LEFT_CCM_R2BRATIO
+	{0xAC5C, 0x03F9, 1}, // AWB_RIGHT_CCM_0
+	{0xAC5E, 0xFD3A, 1}, // AWB_RIGHT_CCM_1
+	{0xAC60, 0xFFD6, 1}, // AWB_RIGHT_CCM_2
+	{0xAC62, 0xFF90, 1}, // AWB_RIGHT_CCM_3
+	{0xAC64, 0x019A, 1}, // AWB_RIGHT_CCM_4
+	{0xAC66, 0xFFDC, 1}, // AWB_RIGHT_CCM_5
+	{0xAC68, 0x0008, 1}, // AWB_RIGHT_CCM_6
+	{0xAC6A, 0xFE56, 1}, // AWB_RIGHT_CCM_7
+	{0xAC6C, 0x029B, 1}, // AWB_RIGHT_CCM_8
+	{0xAC6E, 0x0060, 1}, // AWB_RIGHT_CCM_R2BRATIO
+	// manual_RGB_gain
+	{0xAC97, 0x70, 0}, // [LEFE_Red]
+	{0xAC98, 0x80, 0}, // [LEFE_Green]
+	{0xAC99, 0x90, 0}, // [LEFE_Blue]
+	{0xAC9A, 0x80, 0}, // [RIGHT_Red]
+	{0xAC9B, 0x80, 0}, // [RIGHT_Green]
+	{0xAC9C, 0x80, 0}, // [RIGHT_Blue]
+	{0x098E, 0xA807, 1}, // LOGICAL_ADDRESS_ACCESS [AE_TRACK_JUMP_DIVISOR]
+	{0xA807, 0x02, 0}, // AE_TRACK_JUMP_DIVISOR
+	{0xA80A, 0x02, 0}, // AE_TRACK_NUM_FRAMES_TO_SKIP// ISOÁõ°¡½Ã AE Haunting¹æÁö
+	{0xA824, 0x00E6, 1}, // AE_TRACK_MAX_DGAIN
+	{0xC85C, 0x0423, 1}, // CAM_CORE_A_MIN_FRAME_LENGTH_LINES
+	{0xA818, 0x0420, 1}, // AE_TRACK_TARGET_INT_TIME_ROWS
+	{0xA81A, 0x0C00, 1}, // AE_TRACK_MAX_INT_TIME_ROWS
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_indoor[]=
+{
+	{0xAC44, 0x00, 0}, // AWB_LEFT_CCM_POS_RANGE_LIMIT
+	{0xAC45, 0x7F, 0}, // AWB_RIGHT_CCM_POS_RANGE_LIMIT
+	// Scene
+	{0x098E, 0xB820, 1}, // LOGICAL_ADDRESS_ACCESS [STAT_AE_WINDOW_POS_X]
+	{0xB820, 0x00, 0}, // STAT_AE_WINDOW_POS_X
+	{0xB821, 0x00, 0}, // STAT_AE_WINDOW_POS_Y
+	{0xB822, 0xFE, 0}, // STAT_AE_WINDOW_SIZE_X
+	{0xB823, 0xEF, 0}, // STAT_AE_WINDOW_SIZE_Y
+	{0xA409, 0x44, 0}, // AE_RULE_BASE_TARGET
+	// Neut Gamma 0.4,balck 5, contrast 1.3
+	{0xBC2B, 0x00, 0}, // LL_GAMMA_NEUTRAL_CURVE_0
+	{0xBC2C, 0x0A, 0}, // LL_GAMMA_NEUTRAL_CURVE_1
+	{0xBC2D, 0x1C, 0}, // LL_GAMMA_NEUTRAL_CURVE_2
+	{0xBC2E, 0x36, 0}, // LL_GAMMA_NEUTRAL_CURVE_3
+	{0xBC2F, 0x56, 0}, // LL_GAMMA_NEUTRAL_CURVE_4
+	{0xBC30, 0x70, 0}, // LL_GAMMA_NEUTRAL_CURVE_5
+	{0xBC31, 0x86, 0}, // LL_GAMMA_NEUTRAL_CURVE_6
+	{0xBC32, 0x99, 0}, // LL_GAMMA_NEUTRAL_CURVE_7
+	{0xBC33, 0xA9, 0}, // LL_GAMMA_NEUTRAL_CURVE_8
+	{0xBC34, 0xB6, 0}, // LL_GAMMA_NEUTRAL_CURVE_9
+	{0xBC35, 0xC1, 0}, // LL_GAMMA_NEUTRAL_CURVE_10
+	{0xBC36, 0xCC, 0}, // LL_GAMMA_NEUTRAL_CURVE_11
+	{0xBC37, 0xD5, 0}, // LL_GAMMA_NEUTRAL_CURVE_12
+	{0xBC38, 0xDE, 0}, // LL_GAMMA_NEUTRAL_CURVE_13
+	{0xBC39, 0xE5, 0}, // LL_GAMMA_NEUTRAL_CURVE_14
+	{0xBC3A, 0xEC, 0}, // LL_GAMMA_NEUTRAL_CURVE_15
+	{0xBC3B, 0xF3, 0}, // LL_GAMMA_NEUTRAL_CURVE_16
+	{0xBC3C, 0xF9, 0}, // LL_GAMMA_NEUTRAL_CURVE_17
+	{0xBC3D, 0xFF, 0}, // LL_GAMMA_NEUTRAL_CURVE_18    
+	// CCM
+	{0xAC46, 0x02BD, 1}, // AWB_LEFT_CCM_0
+	{0xAC48, 0xFE51, 1}, // AWB_LEFT_CCM_1
+	{0xAC4A, 0xFFDD, 1}, // AWB_LEFT_CCM_2
+	{0xAC4C, 0xFF92, 1}, // AWB_LEFT_CCM_3
+	{0xAC4E, 0x0152, 1}, // AWB_LEFT_CCM_4
+	{0xAC50, 0x001E, 1}, // AWB_LEFT_CCM_5
+	{0xAC52, 0xFFEF, 1}, // AWB_LEFT_CCM_6
+	{0xAC54, 0xFEEC, 1}, // AWB_LEFT_CCM_7
+	{0xAC56, 0x0226, 1}, // AWB_LEFT_CCM_8
+	{0xAC58, 0x0083, 1}, // AWB_LEFT_CCM_R2BRATIO
+	{0xAC5C, 0x02FA, 1}, // AWB_RIGHT_CCM_0
+	{0xAC5E, 0xFE0E, 1}, // AWB_RIGHT_CCM_1
+	{0xAC60, 0xFFFE, 1}, // AWB_RIGHT_CCM_2
+	{0xAC62, 0xFFA3, 1}, // AWB_RIGHT_CCM_3
+	{0xAC64, 0x010D, 1}, // AWB_RIGHT_CCM_4
+	{0xAC66, 0x0054, 1}, // AWB_RIGHT_CCM_5
+	{0xAC68, 0xFFD7, 1}, // AWB_RIGHT_CCM_6
+	{0xAC6A, 0xFF27, 1}, // AWB_RIGHT_CCM_7
+	{0xAC6C, 0x01FC, 1}, // AWB_RIGHT_CCM_8
+	{0xAC6E, 0x0060, 1}, // AWB_RIGHT_CCM_R2BRATIO
+	// manual_RGB_gain
+	{0xAC97, 0x80, 0}, // [LEFE_Red]
+	{0xAC98, 0x80, 0}, // [LEFE_Green]
+	{0xAC99, 0x60, 0}, // [LEFE_Blue]
+	{0xAC9A, 0x90, 0}, // [RIGHT_Red]
+	{0xAC9B, 0x90, 0}, // [RIGHT_Green]
+	{0xAC9C, 0x70, 0}, // [RIGHT_Blue]
+	{0xC85C, 0x0423, 1}, // CAM_CORE_A_MIN_FRAME_LENGTH_LINES
+	{0xA818, 0x0420, 1}, // AE_TRACK_TARGET_INT_TIME_ROWS
+	{0xA81A, 0x0C00, 1}, // AE_TRACK_MAX_INT_TIME_ROWS
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_night[]=
+{
+#if 0
+	{0xAC44, 0x00, 0}, // AWB_LEFT_CCM_POS_RANGE_LIMIT
+	{0xAC45, 0x7F, 0}, // AWB_RIGHT_CCM_POS_RANGE_LIMIT
+#endif
+	// Scene
+	{0x098E, 0xB820, 1}, // LOGICAL_ADDRESS_ACCESS [STAT_AE_WINDOW_POS_X]
+	{0xB820, 0x30, 0}, // STAT_AE_WINDOW_POS_X
+	{0xB821, 0x40, 0}, // STAT_AE_WINDOW_POS_Y
+	{0xB822, 0xa0, 0}, // STAT_AE_WINDOW_SIZE_X
+	{0xB823, 0x90, 0}, // STAT_AE_WINDOW_SIZE_Y
+	{0xA409, 0x3A, 0}, // AE_RULE_BASE_TARGET
+#if 0
+	// Neut Gamma 0.4,balck 5, contrast 1.3
+	{0xBC2B, 0x00, 0}, // LL_GAMMA_NEUTRAL_CURVE_0
+	{0xBC2C, 0x0A, 0}, // LL_GAMMA_NEUTRAL_CURVE_1
+	{0xBC2D, 0x1C, 0}, // LL_GAMMA_NEUTRAL_CURVE_2
+	{0xBC2E, 0x36, 0}, // LL_GAMMA_NEUTRAL_CURVE_3
+	{0xBC2F, 0x56, 0}, // LL_GAMMA_NEUTRAL_CURVE_4
+	{0xBC30, 0x70, 0}, // LL_GAMMA_NEUTRAL_CURVE_5
+	{0xBC31, 0x86, 0}, // LL_GAMMA_NEUTRAL_CURVE_6
+	{0xBC32, 0x99, 0}, // LL_GAMMA_NEUTRAL_CURVE_7
+	{0xBC33, 0xA9, 0}, // LL_GAMMA_NEUTRAL_CURVE_8
+	{0xBC34, 0xB6, 0}, // LL_GAMMA_NEUTRAL_CURVE_9
+	{0xBC35, 0xC1, 0}, // LL_GAMMA_NEUTRAL_CURVE_10
+	{0xBC36, 0xCC, 0}, // LL_GAMMA_NEUTRAL_CURVE_11
+	{0xBC37, 0xD5, 0}, // LL_GAMMA_NEUTRAL_CURVE_12
+	{0xBC38, 0xDE, 0}, // LL_GAMMA_NEUTRAL_CURVE_13
+	{0xBC39, 0xE5, 0}, // LL_GAMMA_NEUTRAL_CURVE_14
+	{0xBC3A, 0xEC, 0}, // LL_GAMMA_NEUTRAL_CURVE_15
+	{0xBC3B, 0xF3, 0}, // LL_GAMMA_NEUTRAL_CURVE_16
+	{0xBC3C, 0xF9, 0}, // LL_GAMMA_NEUTRAL_CURVE_17
+	{0xBC3D, 0xFF, 0}, // LL_GAMMA_NEUTRAL_CURVE_18
+#endif	
+	// CCM
+	{0xAC46, 0x0314, 1}, // AWB_LEFT_CCM_0
+	{0xAC48, 0xFE15, 1}, // AWB_LEFT_CCM_1
+	{0xAC4A, 0xFFD6, 1}, // AWB_LEFT_CCM_2
+	{0xAC4C, 0xFF85, 1}, // AWB_LEFT_CCM_3
+	{0xAC4E, 0x0186, 1}, // AWB_LEFT_CCM_4
+	{0xAC50, 0xFFF4, 1}, // AWB_LEFT_CCM_5
+	{0xAC52, 0xFFD4, 1}, // AWB_LEFT_CCM_6
+	{0xAC54, 0xFEC5, 1}, // AWB_LEFT_CCM_7
+	{0xAC56, 0x0268, 1}, // AWB_LEFT_CCM_8
+	{0xAC58, 0x008D, 1}, // AWB_LEFT_CCM_R2BRATIO
+	{0xAC5C, 0x02DC, 1}, // AWB_RIGHT_CCM_0
+	{0xAC5E, 0xFE73, 1}, // AWB_RIGHT_CCM_1
+	{0xAC60, 0xFFA0, 1}, // AWB_RIGHT_CCM_2
+	{0xAC62, 0xFFD5, 1}, // AWB_RIGHT_CCM_3
+	{0xAC64, 0x0147, 1}, // AWB_RIGHT_CCM_4
+	{0xAC66, 0xFFE8, 1}, // AWB_RIGHT_CCM_5
+	{0xAC68, 0x0014, 1}, // AWB_RIGHT_CCM_6
+	{0xAC6A, 0xFF26, 1}, // AWB_RIGHT_CCM_7
+	{0xAC6C, 0x01C0, 1}, // AWB_RIGHT_CCM_8
+	{0xAC6E, 0x0060, 1}, // AWB_RIGHT_CCM_R2BRATIO
+	// manual_RGB_gain
+	{0xAC97, 0x70, 0}, // [LEFE_Red]
+	{0xAC98, 0x70, 0}, // [LEFE_Green]
+	{0xAC99, 0x8A, 0}, // [LEFE_Blue]
+	{0xAC9A, 0x7E, 0}, // [RIGHT_Red]
+	{0xAC9B, 0x80, 0}, // [RIGHT_Green]
+	{0xAC9C, 0x81, 0}, // [RIGHT_Blue]
+	{0x098E, 0xA807, 1}, // LOGICAL_ADDRESS_ACCESS [AE_TRACK_JUMP_DIVISOR]
+	{0xA807, 0x03, 0}, // AE_TRACK_JUMP_DIVISOR
+	{0xA80A, 0x03, 0}, // AE_TRACK_NUM_FRAMES_TO_SKIP// ISOÁõ°¡½Ã AE Haunting¹æÁö
+	{0xA824, 0x01E6, 1}, // AE_TRACK_MAX_DGAIN
+	{0xC85C, 0x0423, 1}, // CAM_CORE_A_MIN_FRAME_LENGTH_LINES
+	{0xA818, 0x109F, 1}, // AE_TRACK_TARGET_INT_TIME_ROWS
+	{0xA81A, 0x109F, 1}, // AE_TRACK_MAX_INT_TIME_ROWS
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_sports[]=
+{
+#if 0
+	{0xAC44, 0x00, 0}, // AWB_LEFT_CCM_POS_RANGE_LIMIT
+	{0xAC45, 0x7F, 0}, // AWB_RIGHT_CCM_POS_RANGE_LIMIT
+#endif
+	// Scene
+	{0x098E, 0xB820, 1}, // LOGICAL_ADDRESS_ACCESS [STAT_AE_WINDOW_POS_X]
+	{0xB820, 0x30, 0}, // STAT_AE_WINDOW_POS_X
+	{0xB821, 0x40, 0}, // STAT_AE_WINDOW_POS_Y
+	{0xB822, 0xa0, 0}, // STAT_AE_WINDOW_SIZE_X
+	{0xB823, 0x90, 0}, // STAT_AE_WINDOW_SIZE_Y
+	{0xA409, 0x3A, 0}, // AE_RULE_BASE_TARGET
+#if 0
+	// Neut Gamma 0.4,balck 5, contrast 1.3
+	{0xBC2B, 0x00, 0}, // LL_GAMMA_NEUTRAL_CURVE_0
+	{0xBC2C, 0x0A, 0}, // LL_GAMMA_NEUTRAL_CURVE_1
+	{0xBC2D, 0x1C, 0}, // LL_GAMMA_NEUTRAL_CURVE_2
+	{0xBC2E, 0x36, 0}, // LL_GAMMA_NEUTRAL_CURVE_3
+	{0xBC2F, 0x56, 0}, // LL_GAMMA_NEUTRAL_CURVE_4
+	{0xBC30, 0x70, 0}, // LL_GAMMA_NEUTRAL_CURVE_5
+	{0xBC31, 0x86, 0}, // LL_GAMMA_NEUTRAL_CURVE_6
+	{0xBC32, 0x99, 0}, // LL_GAMMA_NEUTRAL_CURVE_7
+	{0xBC33, 0xA9, 0}, // LL_GAMMA_NEUTRAL_CURVE_8
+	{0xBC34, 0xB6, 0}, // LL_GAMMA_NEUTRAL_CURVE_9
+	{0xBC35, 0xC1, 0}, // LL_GAMMA_NEUTRAL_CURVE_10
+	{0xBC36, 0xCC, 0}, // LL_GAMMA_NEUTRAL_CURVE_11
+	{0xBC37, 0xD5, 0}, // LL_GAMMA_NEUTRAL_CURVE_12
+	{0xBC38, 0xDE, 0}, // LL_GAMMA_NEUTRAL_CURVE_13
+	{0xBC39, 0xE5, 0}, // LL_GAMMA_NEUTRAL_CURVE_14
+	{0xBC3A, 0xEC, 0}, // LL_GAMMA_NEUTRAL_CURVE_15
+	{0xBC3B, 0xF3, 0}, // LL_GAMMA_NEUTRAL_CURVE_16
+	{0xBC3C, 0xF9, 0}, // LL_GAMMA_NEUTRAL_CURVE_17
+	{0xBC3D, 0xFF, 0}, // LL_GAMMA_NEUTRAL_CURVE_18    
+#endif
+	// CCM
+	{0xAC46, 0x0314, 1}, // AWB_LEFT_CCM_0
+	{0xAC48, 0xFE15, 1}, // AWB_LEFT_CCM_1
+	{0xAC4A, 0xFFD6, 1}, // AWB_LEFT_CCM_2
+	{0xAC4C, 0xFF85, 1}, // AWB_LEFT_CCM_3
+	{0xAC4E, 0x0186, 1}, // AWB_LEFT_CCM_4
+	{0xAC50, 0xFFF4, 1}, // AWB_LEFT_CCM_5
+	{0xAC52, 0xFFD4, 1}, // AWB_LEFT_CCM_6
+	{0xAC54, 0xFEC5, 1}, // AWB_LEFT_CCM_7
+	{0xAC56, 0x0268, 1}, // AWB_LEFT_CCM_8
+	{0xAC58, 0x008D, 1}, // AWB_LEFT_CCM_R2BRATIO
+	{0xAC5C, 0x02DC, 1}, // AWB_RIGHT_CCM_0
+	{0xAC5E, 0xFE73, 1}, // AWB_RIGHT_CCM_1
+	{0xAC60, 0xFFA0, 1}, // AWB_RIGHT_CCM_2
+	{0xAC62, 0xFFD5, 1}, // AWB_RIGHT_CCM_3
+	{0xAC64, 0x0147, 1}, // AWB_RIGHT_CCM_4
+	{0xAC66, 0xFFE8, 1}, // AWB_RIGHT_CCM_5
+	{0xAC68, 0x0014, 1}, // AWB_RIGHT_CCM_6
+	{0xAC6A, 0xFF26, 1}, // AWB_RIGHT_CCM_7
+	{0xAC6C, 0x01C0, 1}, // AWB_RIGHT_CCM_8
+	{0xAC6E, 0x0060, 1}, // AWB_RIGHT_CCM_R2BRATIO
+	// manual_RGB_gain
+	{0xAC97, 0x70, 0}, // [LEFE_Red]
+	{0xAC98, 0x70, 0}, // [LEFE_Green]
+	{0xAC99, 0x8A, 0}, // [LEFE_Blue]
+	{0xAC9A, 0x7E, 0}, // [RIGHT_Red]
+	{0xAC9B, 0x80, 0}, // [RIGHT_Green]
+	{0xAC9C, 0x81, 0}, // [RIGHT_Blue]
+	{0x098E, 0xA807, 1}, // LOGICAL_ADDRESS_ACCESS [AE_TRACK_JUMP_DIVISOR]
+	{0xA807, 0x02, 0}, // AE_TRACK_JUMP_DIVISOR
+	{0xA80A, 0x02, 0}, // AE_TRACK_NUM_FRAMES_TO_SKIP// ISOÁõ°¡½Ã AE Haunting¹æÁö
+	{0xA824, 0x00E6, 1}, // AE_TRACK_MAX_DGAIN	
+	{0xC85C, 0x04F2, 1}, // CAM_CORE_A_MIN_FRAME_LENGTH_LINES
+	{0xA818, 0x04F2, 1}, // AE_TRACK_TARGET_INT_TIME_ROWS
+	{0xA81A, 0x04F2, 1}, // AE_TRACK_MAX_INT_TIME_ROWS
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_winter[]=
+{
+	{0xAC44, 0x00, 0}, // AWB_LEFT_CCM_POS_RANGE_LIMIT
+	{0xAC45, 0x7F, 0}, // AWB_RIGHT_CCM_POS_RANGE_LIMIT
+	// Scene
+	{0x098E, 0xB820, 1}, // LOGICAL_ADDRESS_ACCESS [STAT_AE_WINDOW_POS_X]
+	{0xB820, 0x00, 0}, // STAT_AE_WINDOW_POS_X
+	{0xB821, 0x00, 0}, // STAT_AE_WINDOW_POS_Y
+	{0xB822, 0xFE, 0}, // STAT_AE_WINDOW_SIZE_X
+	{0xB823, 0xEF, 0}, // STAT_AE_WINDOW_SIZE_Y
+	{0xA409, 0x60, 0}, // AE_RULE_BASE_TARGET
+	// Neut Gamma 0.4,balck 5, contrast 1.3
+	{0xBC2B, 0x00, 0}, // LL_GAMMA_NEUTRAL_CURVE_0
+	{0xBC2C, 0x08, 0}, // LL_GAMMA_NEUTRAL_CURVE_1
+	{0xBC2D, 0x18, 0}, // LL_GAMMA_NEUTRAL_CURVE_2
+	{0xBC2E, 0x34, 0}, // LL_GAMMA_NEUTRAL_CURVE_3
+	{0xBC2F, 0x55, 0}, // LL_GAMMA_NEUTRAL_CURVE_4
+	{0xBC30, 0x6F, 0}, // LL_GAMMA_NEUTRAL_CURVE_5
+	{0xBC31, 0x85, 0}, // LL_GAMMA_NEUTRAL_CURVE_6
+	{0xBC32, 0x98, 0}, // LL_GAMMA_NEUTRAL_CURVE_7
+	{0xBC33, 0xA8, 0}, // LL_GAMMA_NEUTRAL_CURVE_8
+	{0xBC34, 0xB5, 0}, // LL_GAMMA_NEUTRAL_CURVE_9
+	{0xBC35, 0xC1, 0}, // LL_GAMMA_NEUTRAL_CURVE_10
+	{0xBC36, 0xCC, 0}, // LL_GAMMA_NEUTRAL_CURVE_11
+	{0xBC37, 0xD5, 0}, // LL_GAMMA_NEUTRAL_CURVE_12
+	{0xBC38, 0xDD, 0}, // LL_GAMMA_NEUTRAL_CURVE_13
+	{0xBC39, 0xE5, 0}, // LL_GAMMA_NEUTRAL_CURVE_14
+	{0xBC3A, 0xEC, 0}, // LL_GAMMA_NEUTRAL_CURVE_15
+	{0xBC3B, 0xF3, 0}, // LL_GAMMA_NEUTRAL_CURVE_16
+	{0xBC3C, 0xF9, 0}, // LL_GAMMA_NEUTRAL_CURVE_17
+	{0xBC3D, 0xFF, 0}, // LL_GAMMA_NEUTRAL_CURVE_18    
+	// CCM
+	{0xAC46, 0x0314, 1}, // AWB_LEFT_CCM_0
+	{0xAC48, 0xFE15, 1}, // AWB_LEFT_CCM_1
+	{0xAC4A, 0xFFD6, 1}, // AWB_LEFT_CCM_2
+	{0xAC4C, 0xFF85, 1}, // AWB_LEFT_CCM_3
+	{0xAC4E, 0x0186, 1}, // AWB_LEFT_CCM_4
+	{0xAC50, 0xFFF4, 1}, // AWB_LEFT_CCM_5
+	{0xAC52, 0xFFD4, 1}, // AWB_LEFT_CCM_6
+	{0xAC54, 0xFEC5, 1}, // AWB_LEFT_CCM_7
+	{0xAC56, 0x0268, 1}, // AWB_LEFT_CCM_8
+	{0xAC58, 0x008D, 1}, // AWB_LEFT_CCM_R2BRATIO
+	{0xAC5C, 0x02DC, 1}, // AWB_RIGHT_CCM_0
+	{0xAC5E, 0xFE73, 1}, // AWB_RIGHT_CCM_1
+	{0xAC60, 0xFFA0, 1}, // AWB_RIGHT_CCM_2
+	{0xAC62, 0xFFD5, 1}, // AWB_RIGHT_CCM_3
+	{0xAC64, 0x0147, 1}, // AWB_RIGHT_CCM_4
+	{0xAC66, 0xFFE8, 1}, // AWB_RIGHT_CCM_5
+	{0xAC68, 0x0014, 1}, // AWB_RIGHT_CCM_6
+	{0xAC6A, 0xFF26, 1}, // AWB_RIGHT_CCM_7
+	{0xAC6C, 0x01C0, 1}, // AWB_RIGHT_CCM_8
+	{0xAC6E, 0x0060, 1}, // AWB_RIGHT_CCM_R2BRATIO
+	// manual_RGB_gain
+	{0xAC97, 0x70, 0}, // [LEFE_Red]
+	{0xAC98, 0x70, 0}, // [LEFE_Green]
+	{0xAC99, 0x8A, 0}, // [LEFE_Blue]
+	{0xAC9A, 0x7E, 0}, // [RIGHT_Red]
+	{0xAC9B, 0x80, 0}, // [RIGHT_Green]
+	{0xAC9C, 0x81, 0}, // [RIGHT_Blue]
+	{0xC85C, 0x0423, 1}, // CAM_CORE_A_MIN_FRAME_LENGTH_LINES
+	{0xA818, 0x0420, 1}, // AE_TRACK_TARGET_INT_TIME_ROWS
+	{0xA81A, 0x0C00, 1}, // AE_TRACK_MAX_INT_TIME_ROWS
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_text[]=
+{
+	{0xAC44, 0x00, 0}, // AWB_LEFT_CCM_POS_RANGE_LIMIT
+	{0xAC45, 0x7F, 0}, // AWB_RIGHT_CCM_POS_RANGE_LIMIT
+	// Scene
+	{0x098E, 0xB820, 1}, // LOGICAL_ADDRESS_ACCESS [STAT_AE_WINDOW_POS_X]
+	{0xB820, 0x00, 0}, // STAT_AE_WINDOW_POS_X
+	{0xB821, 0x00, 0}, // STAT_AE_WINDOW_POS_Y
+	{0xB822, 0xFE, 0}, // STAT_AE_WINDOW_SIZE_X
+	{0xB823, 0xEF, 0}, // STAT_AE_WINDOW_SIZE_Y
+	{0xA409, 0x50, 0}, // AE_RULE_BASE_TARGET
+	// Neut Gamma 0.4,balck 5, contrast 1.3
+	{0xBC2B, 0x00, 0}, // LL_GAMMA_NEUTRAL_CURVE_0
+	{0xBC2C, 0x03, 0}, // LL_GAMMA_NEUTRAL_CURVE_1
+	{0xBC2D, 0x0B, 0}, // LL_GAMMA_NEUTRAL_CURVE_2
+	{0xBC2E, 0x1E, 0}, // LL_GAMMA_NEUTRAL_CURVE_3
+	{0xBC2F, 0x3C, 0}, // LL_GAMMA_NEUTRAL_CURVE_4
+	{0xBC30, 0x54, 0}, // LL_GAMMA_NEUTRAL_CURVE_5
+	{0xBC31, 0x6B, 0}, // LL_GAMMA_NEUTRAL_CURVE_6
+	{0xBC32, 0x82, 0}, // LL_GAMMA_NEUTRAL_CURVE_7
+	{0xBC33, 0x96, 0}, // LL_GAMMA_NEUTRAL_CURVE_8
+	{0xBC34, 0xA7, 0}, // LL_GAMMA_NEUTRAL_CURVE_9
+	{0xBC35, 0xB5, 0}, // LL_GAMMA_NEUTRAL_CURVE_10
+	{0xBC36, 0xC2, 0}, // LL_GAMMA_NEUTRAL_CURVE_11
+	{0xBC37, 0xCE, 0}, // LL_GAMMA_NEUTRAL_CURVE_12
+	{0xBC38, 0xD8, 0}, // LL_GAMMA_NEUTRAL_CURVE_13
+	{0xBC39, 0xE1, 0}, // LL_GAMMA_NEUTRAL_CURVE_14
+	{0xBC3A, 0xE9, 0}, // LL_GAMMA_NEUTRAL_CURVE_15
+	{0xBC3B, 0xF1, 0}, // LL_GAMMA_NEUTRAL_CURVE_16
+	{0xBC3C, 0xF8, 0}, // LL_GAMMA_NEUTRAL_CURVE_17
+	{0xBC3D, 0xFF, 0}, // LL_GAMMA_NEUTRAL_CURVE_18    
+	// CCM
+	{0xAC46, 0x02D2, 1}, // AWB_LEFT_CCM_0
+	{0xAC48, 0xFE51, 1}, // AWB_LEFT_CCM_1
+	{0xAC4A, 0xFFDD, 1}, // AWB_LEFT_CCM_2
+	{0xAC4C, 0xFF98, 1}, // AWB_LEFT_CCM_3
+	{0xAC4E, 0x0170, 1}, // AWB_LEFT_CCM_4
+	{0xAC50, 0xFFF8, 1}, // AWB_LEFT_CCM_5
+	{0xAC52, 0xFFDF, 1}, // AWB_LEFT_CCM_6
+	{0xAC54, 0xFEF0, 1}, // AWB_LEFT_CCM_7
+	{0xAC56, 0x0231, 1}, // AWB_LEFT_CCM_8
+	{0xAC58, 0x0083, 1}, // AWB_LEFT_CCM_R2BRATIO
+	{0xAC5C, 0x02FD, 1}, // AWB_RIGHT_CCM_0
+	{0xAC5E, 0xFE58, 1}, // AWB_RIGHT_CCM_1
+	{0xAC60, 0xFF9A, 1}, // AWB_RIGHT_CCM_2
+	{0xAC62, 0xFFCF, 1}, // AWB_RIGHT_CCM_3
+	{0xAC64, 0x0150, 1}, // AWB_RIGHT_CCM_4
+	{0xAC66, 0xFFE6, 1}, // AWB_RIGHT_CCM_5
+	{0xAC68, 0x0011, 1}, // AWB_RIGHT_CCM_6
+	{0xAC6A, 0xFF14, 1}, // AWB_RIGHT_CCM_7
+	{0xAC6C, 0x01D5, 1}, // AWB_RIGHT_CCM_8
+	{0xAC6E, 0x0060, 1}, // AWB_RIGHT_CCM_R2BRATIO
+	// manual_RGB_gain
+	{0xAC97, 0x70, 0}, // [LEFE_Red]
+	{0xAC98, 0x80, 0}, // [LEFE_Green]
+	{0xAC99, 0x90, 0}, // [LEFE_Blue]
+	{0xAC9A, 0x80, 0}, // [RIGHT_Red]
+	{0xAC9B, 0x80, 0}, // [RIGHT_Green]
+	{0xAC9C, 0x80, 0}, // [RIGHT_Blue]
+	{0xC85C, 0x0423, 1}, // CAM_CORE_A_MIN_FRAME_LENGTH_LINES
+	{0xA818, 0x0420, 1}, // AE_TRACK_TARGET_INT_TIME_ROWS
+	{0xA81A, 0x0C00, 1}, // AE_TRACK_MAX_INT_TIME_ROWS
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_sunset[]=
+{
+	{0xAC44, 0x00, 0}, // AWB_LEFT_CCM_POS_RANGE_LIMIT
+	{0xAC45, 0x7F, 0}, // AWB_RIGHT_CCM_POS_RANGE_LIMIT
+	// Scene
+	{0x098E, 0xB820, 1}, // LOGICAL_ADDRESS_ACCESS [STAT_AE_WINDOW_POS_X]
+	{0xB820, 0x40, 0}, // STAT_AE_WINDOW_POS_X
+	{0xB821, 0x40, 0}, // STAT_AE_WINDOW_POS_Y
+	{0xB822, 0xBF, 0}, // STAT_AE_WINDOW_SIZE_X
+	{0xB823, 0xAF, 0}, // STAT_AE_WINDOW_SIZE_Y
+	{0xA409, 0x44, 0}, // AE_RULE_BASE_TARGET
+	// Neut Gamma 0.4,balck 5, contrast 1.3
+	{0xBC2B, 0x00, 0}, // LL_GAMMA_NEUTRAL_CURVE_0
+	{0xBC2C, 0x08, 0}, // LL_GAMMA_NEUTRAL_CURVE_1
+	{0xBC2D, 0x18, 0}, // LL_GAMMA_NEUTRAL_CURVE_2
+	{0xBC2E, 0x34, 0}, // LL_GAMMA_NEUTRAL_CURVE_3
+	{0xBC2F, 0x55, 0}, // LL_GAMMA_NEUTRAL_CURVE_4
+	{0xBC30, 0x6F, 0}, // LL_GAMMA_NEUTRAL_CURVE_5
+	{0xBC31, 0x85, 0}, // LL_GAMMA_NEUTRAL_CURVE_6
+	{0xBC32, 0x98, 0}, // LL_GAMMA_NEUTRAL_CURVE_7
+	{0xBC33, 0xA8, 0}, // LL_GAMMA_NEUTRAL_CURVE_8
+	{0xBC34, 0xB5, 0}, // LL_GAMMA_NEUTRAL_CURVE_9
+	{0xBC35, 0xC1, 0}, // LL_GAMMA_NEUTRAL_CURVE_10
+	{0xBC36, 0xCC, 0}, // LL_GAMMA_NEUTRAL_CURVE_11
+	{0xBC37, 0xD5, 0}, // LL_GAMMA_NEUTRAL_CURVE_12
+	{0xBC38, 0xDD, 0}, // LL_GAMMA_NEUTRAL_CURVE_13
+	{0xBC39, 0xE5, 0}, // LL_GAMMA_NEUTRAL_CURVE_14
+	{0xBC3A, 0xEC, 0}, // LL_GAMMA_NEUTRAL_CURVE_15
+	{0xBC3B, 0xF3, 0}, // LL_GAMMA_NEUTRAL_CURVE_16
+	{0xBC3C, 0xF9, 0}, // LL_GAMMA_NEUTRAL_CURVE_17
+	{0xBC3D, 0xFF, 0}, // LL_GAMMA_NEUTRAL_CURVE_18    
+	// CCM
+	{0xAC46, 0x02D2, 1}, // AWB_LEFT_CCM_0
+	{0xAC48, 0xFE51, 1}, // AWB_LEFT_CCM_1
+	{0xAC4A, 0xFFDD, 1}, // AWB_LEFT_CCM_2
+	{0xAC4C, 0xFF98, 1}, // AWB_LEFT_CCM_3
+	{0xAC4E, 0x0170, 1}, // AWB_LEFT_CCM_4
+	{0xAC50, 0xFFF8, 1}, // AWB_LEFT_CCM_5
+	{0xAC52, 0xFFDF, 1}, // AWB_LEFT_CCM_6
+	{0xAC54, 0xFEF0, 1}, // AWB_LEFT_CCM_7
+	{0xAC56, 0x0231, 1}, // AWB_LEFT_CCM_8
+	{0xAC58, 0x0083, 1}, // AWB_LEFT_CCM_R2BRATIO
+	{0xAC5C, 0x02ED, 1}, // AWB_RIGHT_CCM_0
+	{0xAC5E, 0xFE42, 1}, // AWB_RIGHT_CCM_1
+	{0xAC60, 0xFFD7, 1}, // AWB_RIGHT_CCM_2
+	{0xAC62, 0xFFCE, 1}, // AWB_RIGHT_CCM_3
+	{0xAC64, 0x0150, 1}, // AWB_RIGHT_CCM_4
+	{0xAC66, 0xFFE6, 1}, // AWB_RIGHT_CCM_5
+	{0xAC68, 0x0012, 1}, // AWB_RIGHT_CCM_6
+	{0xAC6A, 0xFF14, 1}, // AWB_RIGHT_CCM_7
+	{0xAC6C, 0x01D5, 1}, // AWB_RIGHT_CCM_8
+	{0xAC6E, 0x0060, 1}, // AWB_RIGHT_CCM_R2BRATIO
+	// manual_RGB_gain
+	{0xAC97, 0x70, 0}, // [LEFE_Red]
+	{0xAC98, 0x80, 0}, // [LEFE_Green]
+	{0xAC99, 0x90, 0}, // [LEFE_Blue]
+	{0xAC9A, 0x80, 0}, // [RIGHT_Red]
+	{0xAC9B, 0x80, 0}, // [RIGHT_Green]
+	{0xAC9C, 0x80, 0}, // [RIGHT_Blue]
+	{0xC85C, 0x0423, 1}, // CAM_CORE_A_MIN_FRAME_LENGTH_LINES
+	{0xA818, 0x0420, 1}, // AE_TRACK_TARGET_INT_TIME_ROWS
+	{0xA81A, 0x0C00, 1}, // AE_TRACK_MAX_INT_TIME_ROWS
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_beach[]=
+{
+	{0xAC44, 0x00, 0}, // AWB_LEFT_CCM_POS_RANGE_LIMIT
+	{0xAC45, 0x7F, 0}, // AWB_RIGHT_CCM_POS_RANGE_LIMIT
+	// Scene
+	{0x098E, 0xB820, 1}, // LOGICAL_ADDRESS_ACCESS [STAT_AE_WINDOW_POS_X]
+	{0xB820, 0x00, 0}, // STAT_AE_WINDOW_POS_X
+	{0xB821, 0x00, 0}, // STAT_AE_WINDOW_POS_Y
+	{0xB822, 0xFE, 0}, // STAT_AE_WINDOW_SIZE_X
+	{0xB823, 0xEF, 0}, // STAT_AE_WINDOW_SIZE_Y
+	{0xA409, 0x44, 0}, // AE_RULE_BASE_TARGET
+	// Neut Gamma 0.4,balck 5, contrast 1.3
+	{0xBC2B, 0x00, 0}, // LL_GAMMA_NEUTRAL_CURVE_0
+	{0xBC2C, 0x08, 0}, // LL_GAMMA_NEUTRAL_CURVE_1
+	{0xBC2D, 0x18, 0}, // LL_GAMMA_NEUTRAL_CURVE_2
+	{0xBC2E, 0x34, 0}, // LL_GAMMA_NEUTRAL_CURVE_3
+	{0xBC2F, 0x55, 0}, // LL_GAMMA_NEUTRAL_CURVE_4
+	{0xBC30, 0x6F, 0}, // LL_GAMMA_NEUTRAL_CURVE_5
+	{0xBC31, 0x85, 0}, // LL_GAMMA_NEUTRAL_CURVE_6
+	{0xBC32, 0x98, 0}, // LL_GAMMA_NEUTRAL_CURVE_7
+	{0xBC33, 0xA8, 0}, // LL_GAMMA_NEUTRAL_CURVE_8
+	{0xBC34, 0xB5, 0}, // LL_GAMMA_NEUTRAL_CURVE_9
+	{0xBC35, 0xC1, 0}, // LL_GAMMA_NEUTRAL_CURVE_10
+	{0xBC36, 0xCC, 0}, // LL_GAMMA_NEUTRAL_CURVE_11
+	{0xBC37, 0xD5, 0}, // LL_GAMMA_NEUTRAL_CURVE_12
+	{0xBC38, 0xDD, 0}, // LL_GAMMA_NEUTRAL_CURVE_13
+	{0xBC39, 0xE5, 0}, // LL_GAMMA_NEUTRAL_CURVE_14
+	{0xBC3A, 0xEC, 0}, // LL_GAMMA_NEUTRAL_CURVE_15
+	{0xBC3B, 0xF3, 0}, // LL_GAMMA_NEUTRAL_CURVE_16
+	{0xBC3C, 0xF9, 0}, // LL_GAMMA_NEUTRAL_CURVE_17
+	{0xBC3D, 0xFF, 0}, // LL_GAMMA_NEUTRAL_CURVE_18    
+	// CCM
+	{0xAC46, 0x02D2, 1}, // AWB_LEFT_CCM_0
+	{0xAC48, 0xFE51, 1}, // AWB_LEFT_CCM_1
+	{0xAC4A, 0xFFDD, 1}, // AWB_LEFT_CCM_2
+	{0xAC4C, 0xFF98, 1}, // AWB_LEFT_CCM_3
+	{0xAC4E, 0x0170, 1}, // AWB_LEFT_CCM_4
+	{0xAC50, 0xFFF8, 1}, // AWB_LEFT_CCM_5
+	{0xAC52, 0xFFDF, 1}, // AWB_LEFT_CCM_6
+	{0xAC54, 0xFEF0, 1}, // AWB_LEFT_CCM_7
+	{0xAC56, 0x0231, 1}, // AWB_LEFT_CCM_8
+	{0xAC58, 0x00A3, 1}, // AWB_LEFT_CCM_R2BRATIO
+	{0xAC5C, 0x02C9, 1}, // AWB_RIGHT_CCM_0
+	{0xAC5E, 0xFE50, 1}, // AWB_RIGHT_CCM_1
+	{0xAC60, 0xFFED, 1}, // AWB_RIGHT_CCM_2
+	{0xAC62, 0xFFCD, 1}, // AWB_RIGHT_CCM_3
+	{0xAC64, 0x0146, 1}, // AWB_RIGHT_CCM_4
+	{0xAC66, 0xFFF1, 1}, // AWB_RIGHT_CCM_5
+	{0xAC68, 0x001E, 1}, // AWB_RIGHT_CCM_6
+	{0xAC6A, 0xFF10, 1}, // AWB_RIGHT_CCM_7
+	{0xAC6C, 0x01CD, 1}, // AWB_RIGHT_CCM_8
+	{0xAC6E, 0x0080, 1}, // AWB_RIGHT_CCM_R2BRATIO
+	// manual_RGB_gain
+	{0xAC97, 0x60, 0}, // [LEFE_Red]
+	{0xAC98, 0x80, 0}, // [LEFE_Green]
+	{0xAC99, 0x90, 0}, // [LEFE_Blue]
+	{0xAC9A, 0x60, 0}, // [RIGHT_Red]
+	{0xAC9B, 0x70, 0}, // [RIGHT_Green]
+	{0xAC9C, 0x90, 0}, // [RIGHT_Blue]
+	{0xC85C, 0x0423, 1}, // CAM_CORE_A_MIN_FRAME_LENGTH_LINES
+	{0xA818, 0x0420, 1}, // AE_TRACK_TARGET_INT_TIME_ROWS
+	{0xA81A, 0x0C00, 1}, // AE_TRACK_MAX_INT_TIME_ROWS
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_party[]=
+{
+	{0xAC44, 0x00, 0}, // AWB_LEFT_CCM_POS_RANGE_LIMIT
+	{0xAC45, 0x7F, 0}, // AWB_RIGHT_CCM_POS_RANGE_LIMIT
+	// Scene
+	{0x098E, 0xB820, 1}, // LOGICAL_ADDRESS_ACCESS [STAT_AE_WINDOW_POS_X]
+	{0xB820, 0x00, 0}, // STAT_AE_WINDOW_POS_X
+	{0xB821, 0x00, 0}, // STAT_AE_WINDOW_POS_Y
+	{0xB822, 0xFE, 0}, // STAT_AE_WINDOW_SIZE_X
+	{0xB823, 0xEF, 0}, // STAT_AE_WINDOW_SIZE_Y
+	{0xA409, 0x60, 0}, // AE_RULE_BASE_TARGET
+	// Neut Gamma 0.4,balck 5, contrast 1.3
+	{0xBC2B, 0x00, 0}, // LL_GAMMA_NEUTRAL_CURVE_0
+	{0xBC2C, 0x08, 0}, // LL_GAMMA_NEUTRAL_CURVE_1
+	{0xBC2D, 0x18, 0}, // LL_GAMMA_NEUTRAL_CURVE_2
+	{0xBC2E, 0x34, 0}, // LL_GAMMA_NEUTRAL_CURVE_3
+	{0xBC2F, 0x55, 0}, // LL_GAMMA_NEUTRAL_CURVE_4
+	{0xBC30, 0x6F, 0}, // LL_GAMMA_NEUTRAL_CURVE_5
+	{0xBC31, 0x85, 0}, // LL_GAMMA_NEUTRAL_CURVE_6
+	{0xBC32, 0x98, 0}, // LL_GAMMA_NEUTRAL_CURVE_7
+	{0xBC33, 0xA8, 0}, // LL_GAMMA_NEUTRAL_CURVE_8
+	{0xBC34, 0xB5, 0}, // LL_GAMMA_NEUTRAL_CURVE_9
+	{0xBC35, 0xC1, 0}, // LL_GAMMA_NEUTRAL_CURVE_10
+	{0xBC36, 0xCC, 0}, // LL_GAMMA_NEUTRAL_CURVE_11
+	{0xBC37, 0xD5, 0}, // LL_GAMMA_NEUTRAL_CURVE_12
+	{0xBC38, 0xDD, 0}, // LL_GAMMA_NEUTRAL_CURVE_13
+	{0xBC39, 0xE5, 0}, // LL_GAMMA_NEUTRAL_CURVE_14
+	{0xBC3A, 0xEC, 0}, // LL_GAMMA_NEUTRAL_CURVE_15
+	{0xBC3B, 0xF3, 0}, // LL_GAMMA_NEUTRAL_CURVE_16
+	{0xBC3C, 0xF9, 0}, // LL_GAMMA_NEUTRAL_CURVE_17
+	{0xBC3D, 0xFF, 0}, // LL_GAMMA_NEUTRAL_CURVE_18    
+	// CCM
+	{0xAC46, 0x02D2, 1}, // AWB_LEFT_CCM_0
+	{0xAC48, 0xFE51, 1}, // AWB_LEFT_CCM_1
+	{0xAC4A, 0xFFDD, 1}, // AWB_LEFT_CCM_2
+	{0xAC4C, 0xFF98, 1}, // AWB_LEFT_CCM_3
+	{0xAC4E, 0x0170, 1}, // AWB_LEFT_CCM_4
+	{0xAC50, 0xFFF8, 1}, // AWB_LEFT_CCM_5
+	{0xAC52, 0xFFDF, 1}, // AWB_LEFT_CCM_6
+	{0xAC54, 0xFEF0, 1}, // AWB_LEFT_CCM_7
+	{0xAC56, 0x0231, 1}, // AWB_LEFT_CCM_8
+	{0xAC58, 0x0083, 1}, // AWB_LEFT_CCM_R2BRATIO
+	{0xAC5C, 0x02FD, 1}, // AWB_RIGHT_CCM_0
+	{0xAC5E, 0xFE58, 1}, // AWB_RIGHT_CCM_1
+	{0xAC60, 0xFF9A, 1}, // AWB_RIGHT_CCM_2
+	{0xAC62, 0xFFCF, 1}, // AWB_RIGHT_CCM_3
+	{0xAC64, 0x0150, 1}, // AWB_RIGHT_CCM_4
+	{0xAC66, 0xFFE6, 1}, // AWB_RIGHT_CCM_5
+	{0xAC68, 0x0011, 1}, // AWB_RIGHT_CCM_6
+	{0xAC6A, 0xFF14, 1}, // AWB_RIGHT_CCM_7
+	{0xAC6C, 0x01D5, 1}, // AWB_RIGHT_CCM_8
+	{0xAC6E, 0x0060, 1}, // AWB_RIGHT_CCM_R2BRATIO
+	// manual_RGB_gain
+	{0xAC97, 0x70, 0}, // [LEFE_Red]
+	{0xAC98, 0x80, 0}, // [LEFE_Green]
+	{0xAC99, 0x90, 0}, // [LEFE_Blue]
+	{0xAC9A, 0x80, 0}, // [RIGHT_Red]
+	{0xAC9B, 0x80, 0}, // [RIGHT_Green]
+	{0xAC9C, 0x80, 0}, // [RIGHT_Blue]
+	{0xC85C, 0x0423, 1}, // CAM_CORE_A_MIN_FRAME_LENGTH_LINES
+	{0xA818, 0x0420, 1}, // AE_TRACK_TARGET_INT_TIME_ROWS
+	{0xA81A, 0x06F7, 1}, // AE_TRACK_MAX_INT_TIME_ROWS
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_SOC_ISO_50_old[]=
+{
+	{0x098E, 0x281C, 1}, // LOGICAL_ADDRESS_ACCESS [AE_TRACK_MIN_AGAIN]
+	{0xA81C, 0x0040, 1}, // AE_TRACK_MIN_AGAIN
+	{0xA81E, 0x0040, 1}, // AE_TRACK_TARGET_AGAIN
+	{0xA820, 0x0040, 1}, // AE_TRACK_MAX_AGAIN
+	{0xA822, 0x0080, 1}, // AE_TRACK_MIN_DGAIN
+	{0xA824, 0x00A6, 1}, // AE_TRACK_MAX_DGAIN
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_SOC_ISO_100_old[]=
+{
+	{0x098E, 0x281C, 1}, // LOGICAL_ADDRESS_ACCESS [AE_TRACK_MIN_AGAIN]
+	{0xA81C, 0x0040, 1}, // AE_TRACK_MIN_AGAIN
+	{0xA81E, 0x0090, 1}, // AE_TRACK_TARGET_AGAIN
+	{0xA820, 0x00AC, 1}, // AE_TRACK_MAX_AGAIN
+	{0xA822, 0x0080, 1}, // AE_TRACK_MIN_DGAIN
+	{0xA824, 0x00A6, 1}, // AE_TRACK_MAX_DGAIN
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_SOC_ISO_200_old[]=
+{
+	{0x098E, 0x281C, 1}, // LOGICAL_ADDRESS_ACCESS [AE_TRACK_MIN_AGAIN]
+	{0xA81C, 0x0040, 1}, // AE_TRACK_MIN_AGAIN
+	{0xA81E, 0x0100, 1}, // AE_TRACK_TARGET_AGAIN
+	{0xA820, 0x0130, 1}, // AE_TRACK_MAX_AGAIN
+	{0xA822, 0x0080, 1}, // AE_TRACK_MIN_DGAIN
+	{0xA824, 0x00A6, 1}, // AE_TRACK_MAX_DGAIN
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_SOC_ISO_400_old[]=
+{
+	{0x098E, 0x281E, 1}, // LOGICAL_ADDRESS_ACCESS [AE_TRACK_MIN_AGAIN]
+	{0xA81C, 0x0080, 1}, // AE_TRACK_MIN_AGAIN
+	{0xA81E, 0x0120, 1}, // AE_TRACK_TARGET_AGAIN
+	{0xA820, 0x0140, 1}, // AE_TRACK_MAX_AGAIN
+	{0xA822, 0x00E0, 1}, // AE_TRACK_MIN_DGAIN
+	{0xA824, 0x00E0, 1}, // AE_TRACK_MAX_DGAIN
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_SOC_ISO_800_old[]=
+{
+	{0x098E, 0x281E, 1}, // LOGICAL_ADDRESS_ACCESS [AE_TRACK_MIN_AGAIN]
+	{0xA81C, 0x0120, 1}, // AE_TRACK_MIN_AGAIN
+	{0xA81E, 0x0150, 1}, // AE_TRACK_TARGET_AGAIN
+	{0xA820, 0x0150, 1}, // AE_TRACK_MAX_AGAIN
+	{0xA822, 0x0100, 1}, // AE_TRACK_MIN_DGAIN
+	{0xA824, 0x0100, 1}, // AE_TRACK_MAX_DGAIN
+	{0x8404, 0x06, 0}, // SEQ_CMD
+};
+
+//new ISO setting
+struct mt9p111_reg_cfg mt9p111_SOC_ISO_Auto[]=
+{
+	{0x098E, 0x3C5A, 1},      // LOGICAL_ADDRESS_ACCESS [LL_END_GAIN_METRIC]
+	{0xBC5A, 0x05DC, 1},     // LL_END_GAIN_METRIC  //saturation
+	{0x098E, 0xA807, 1}, 	// LOGICAL_ADDRESS_ACCESS [AE_TRACK_JUMP_DIVISOR]
+	{0xA807, 0x02  , 0},	// AE_TRACK_JUMP_DIVISOR
+	{0xA80A, 0x02  , 0},	// AE_TRACK_NUM_FRAMES_TO_SKIP// ISO AE Haunting
+	{0x098E, 0x3C60, 1}, 	// LOGICAL_ADDRESS_ACCESS [LL_END_APERTURE_GAIN_BM]
+	{0xBC60, 0x0300, 1}, 	// LL_END_APERTURE_GAIN_BM//ISO sharpness
+	{0xA409, 0x3A  , 0},       // AE_RULE_BASE_TARGET[brightness_target]  //ISO
+	{0x098E, 0x281C, 1},      // LOGICAL_ADDRESS_ACCESS [AE_TRACK_MIN_AGAIN]
+	{0xA81C, 0x0040, 1},      // AE_TRACK_MIN_AGAIN
+	{0xA81E, 0x0100, 1},      // AE_TRACK_TARGET_AGAIN
+	{0xA820, 0x0130, 1},      // AE_TRACK_MAX_AGAIN
+	{0xA822, 0x0080, 1},      // AE_TRACK_MIN_DGAIN
+	{0xA824, 0x00E6, 1},     // AE_TRACK_MAX_DGAIN// initial
+	{0x8404, 0x06  , 0},       // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_SOC_ISO_100[]=
+{
+//	{0x098E, 0x3C5A, 1},      // LOGICAL_ADDRESS_ACCESS [LL_END_GAIN_METRIC]
+//	{0xBC5A, 0x07DC, 1},     // LL_END_GAIN_METRIC
+//	{0xA409, 0x4a  , 0},       // AE_RULE_BASE_TARGET[brightness_target]    
+//	{0x098E, 0x281C, 1},      // LOGICAL_ADDRESS_ACCESS [AE_TRACK_MIN_AGAIN]
+//	{0xA81C, 0x0040, 1},      // AE_TRACK_MIN_AGAIN
+//	{0xA81E, 0x0050, 1},      // AE_TRACK_TARGET_AGAIN
+//	{0xA820, 0x0060, 1},      // AE_TRACK_MAX_AGAIN
+//	{0xA822, 0x0080, 1},      // AE_TRACK_MIN_DGAIN
+//	{0xA824, 0x00A6, 1},     // AE_TRACK_MAX_DGAIN
+//	{0x8404, 0x06  , 0},       // SEQ_CMD
+
+	{0x098E, 0x3C5A, 1},      // LOGICAL_ADDRESS_ACCESS [LL_END_GAIN_METRIC]
+	{0xBC5A, 0x07DC, 1},     // LL_END_GAIN_METRIC
+	{0x098E, 0xA807, 1}, 	// LOGICAL_ADDRESS_ACCESS [AE_TRACK_JUMP_DIVISOR]
+	{0xA807, 0x03  , 0},	// AE_TRACK_JUMP_DIVISOR
+	{0xA80A, 0x03  , 0},	// AE_TRACK_NUM_FRAMES_TO_SKIP
+	{0x098E, 0x3C60, 1}, 	// LOGICAL_ADDRESS_ACCESS [LL_END_APERTURE_GAIN_BM]
+	{0xBC60, 0x0310, 1}, 	// LL_END_APERTURE_GAIN_BM
+	{0xA409, 0x40  , 0},       // AE_RULE_BASE_TARGET[brightness_target]     
+	{0x098E, 0x281C, 1},      // LOGICAL_ADDRESS_ACCESS [AE_TRACK_MIN_AGAIN]
+	{0xA81C, 0x0040, 1},      // AE_TRACK_MIN_AGAIN
+	{0xA81E, 0x0050, 1},      // AE_TRACK_TARGET_AGAIN
+	{0xA820, 0x0060, 1},      // AE_TRACK_MAX_AGAIN
+	{0xA822, 0x0080, 1},      // AE_TRACK_MIN_DGAIN
+	{0xA824, 0x00E6, 1},     // AE_TRACK_MAX_DGAIN
+	{0x8404, 0x06  , 0},         // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_SOC_ISO_200[]=
+{
+//	{0x098E, 0x3C5A,1},      // LOGICAL_ADDRESS_ACCESS [LL_END_GAIN_METRIC]
+//	{0xBC5A, 0x07DC,1},     // LL_END_GAIN_METRIC
+//	{0xA409, 0x5a  ,0},       // AE_RULE_BASE_TARGET[brightness_target]    
+//	{0x098E, 0x281C,1},      // LOGICAL_ADDRESS_ACCESS [AE_TRACK_MIN_AGAIN]
+//	{0xA81C, 0x0060,1},      // AE_TRACK_MIN_AGAIN
+//	{0xA81E, 0x0080,1},      // AE_TRACK_TARGET_AGAIN
+//	{0xA820, 0x0090,1},      // AE_TRACK_MAX_AGAIN
+//	{0xA822, 0x0080,1},      // AE_TRACK_MIN_DGAIN
+//	{0xA824, 0x00A6,1},     // AE_TRACK_MAX_DGAIN
+//	{0x8404, 0x06  ,0},       // SEQ_CMD
+	
+	{0x098E, 0x3C5A, 1},      // LOGICAL_ADDRESS_ACCESS [LL_END_GAIN_METRIC]
+	{0xBC5A, 0x07DC, 1},     // LL_END_GAIN_METRIC
+	{0x098E, 0xA807, 1}, 	// LOGICAL_ADDRESS_ACCESS [AE_TRACK_JUMP_DIVISOR]
+	{0xA807, 0x03  , 0},// AE_TRACK_JUMP_DIVISOR
+	{0xA80A, 0x03  , 0},// AE_TRACK_NUM_FRAMES_TO_SKIP
+	{0x098E, 0x3C60, 1}, 	// LOGICAL_ADDRESS_ACCESS [LL_END_APERTURE_GAIN_BM]
+	{0xBC60, 0x0310, 1}, 	// LL_END_APERTURE_GAIN_BM
+	{0xA409, 0x4A  , 0},       // AE_RULE_BASE_TARGET[brightness_target]     
+	{0x098E, 0x281C, 1},      // LOGICAL_ADDRESS_ACCESS [AE_TRACK_MIN_AGAIN]
+	{0xA81C, 0x0060, 1},      // AE_TRACK_MIN_AGAIN
+	{0xA81E, 0x0080, 1},      // AE_TRACK_TARGET_AGAIN
+	{0xA820, 0x0090, 1},      // AE_TRACK_MAX_AGAIN
+	{0xA822, 0x0080, 1},      // AE_TRACK_MIN_DGAIN
+	{0xA824, 0x00E6, 1},     // AE_TRACK_MAX_DGAIN
+	{0x8404, 0x06  , 0},       // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_SOC_ISO_400[]=
+{
+//	{0x098E, 0x3C5A,1},      // LOGICAL_ADDRESS_ACCESS [LL_END_GAIN_METRIC]
+//	{0xBC5A, 0x07DC,1},     // LL_END_GAIN_METRIC
+//	{0xA409, 0x5a  ,0},       // AE_RULE_BASE_TARGET[brightness_target]    
+//	{0x098E, 0x281C,1},      // LOGICAL_ADDRESS_ACCESS [AE_TRACK_MIN_AGAIN]
+//	{0xA81C, 0x00a0,1},      // AE_TRACK_MIN_AGAIN
+//	{0xA81E, 0x00c0,1},      // AE_TRACK_TARGET_AGAIN
+//	{0xA820, 0x00D0,1},     // AE_TRACK_MAX_AGAIN
+//	{0xA822, 0x0090,1},      // AE_TRACK_MIN_DGAIN
+//	{0xA824, 0x00A6,1},     // AE_TRACK_MAX_DGAIN
+//	{0x8404, 0x06  ,0},       // SEQ_CMD
+
+	{0x098E, 0x3C5A , 1},     // LOGICAL_ADDRESS_ACCESS [LL_END_GAIN_METRIC]
+	{0xBC5A, 0x07DC , 1},    // LL_END_GAIN_METRIC
+	{0x098E, 0xA807 , 1},	// LOGICAL_ADDRESS_ACCESS [AE_TRACK_JUMP_DIVISOR]
+	{0xA807, 0x03 	, 0},// AE_TRACK_JUMP_DIVISOR
+	{0xA80A, 0x03 	, 0},// AE_TRACK_NUM_FRAMES_TO_SKIP
+	{0x098E, 0x3C60 , 1},	// LOGICAL_ADDRESS_ACCESS [LL_END_APERTURE_GAIN_BM]
+	{0xBC60, 0x0310 , 1},	// LL_END_APERTURE_GAIN_BM
+	{0xA409, 0x50   , 0},      // AE_RULE_BASE_TARGET[brightness_target]     
+	{0x098E, 0x281C , 1},     // LOGICAL_ADDRESS_ACCESS [AE_TRACK_MIN_AGAIN]
+	{0xA81C, 0x00a0 , 1},     // AE_TRACK_MIN_AGAIN
+	{0xA81E, 0x00c0 , 1},     // AE_TRACK_TARGET_AGAIN
+	{0xA820, 0x00D0 , 1},    // AE_TRACK_MAX_AGAIN
+	{0xA822, 0x0090 , 1},     // AE_TRACK_MIN_DGAIN
+	{0xA824, 0x00E6 , 1},    // AE_TRACK_MAX_DGAIN
+	{0x8404, 0x06   , 0},      // SEQ_CMD
+};
+
+struct mt9p111_reg_cfg mt9p111_SOC_ISO_800[]=
+{
+//	{0x098E, 0x3C5A,1},      // LOGICAL_ADDRESS_ACCESS [LL_END_GAIN_METRIC]
+//	{0xBC5A, 0x07DC,1},     // LL_END_GAIN_METRIC
+//	{0xA409, 0x5a  ,0},       // AE_RULE_BASE_TARGET[brightness_target]    
+//	{0x098E, 0x281C,1},      // LOGICAL_ADDRESS_ACCESS [AE_TRACK_MIN_AGAIN]
+//	{0xA81C, 0x00d0,1},     // AE_TRACK_MIN_AGAIN
+//	{0xA81E, 0x0100,1},      // AE_TRACK_TARGET_AGAIN
+//	{0xA820, 0x0130,1},      // AE_TRACK_MAX_AGAIN
+//	{0xA822, 0x00B0,1},      // AE_TRACK_MIN_DGAIN
+//	{0xA824, 0x00B6,1},      // AE_TRACK_MAX_DGAIN
+//	{0x8404, 0x06  ,0},       // SEQ_CMD
+
+	{0x098E, 0x3C5A , 1},     // LOGICAL_ADDRESS_ACCESS [LL_END_GAIN_METRIC]
+	{0xBC5A, 0x07DC , 1},    // LL_END_GAIN_METRIC
+	{0x098E, 0xA807 , 1},	// LOGICAL_ADDRESS_ACCESS [AE_TRACK_JUMP_DIVISOR]
+	{0xA807, 0x03 	, 0},// AE_TRACK_JUMP_DIVISOR
+	{0xA80A, 0x03 	, 0},// AE_TRACK_NUM_FRAMES_TO_SKIP
+	{0x098E, 0x3C60 , 1},	// LOGICAL_ADDRESS_ACCESS [LL_END_APERTURE_GAIN_BM]
+	{0xBC60, 0x0310 , 1},	// LL_END_APERTURE_GAIN_BM
+	{0xA409, 0x50   , 0},      // AE_RULE_BASE_TARGET[brightness_target]     
+	{0x098E, 0x281C , 1},     // LOGICAL_ADDRESS_ACCESS [AE_TRACK_MIN_AGAIN]
+	{0xA81C, 0x00d0 , 1},    // AE_TRACK_MIN_AGAIN
+	{0xA81E, 0x0100 , 1},     // AE_TRACK_TARGET_AGAIN
+	{0xA820, 0x0130 , 1},     // AE_TRACK_MAX_AGAIN
+	{0xA822, 0x00B0 , 1},     // AE_TRACK_MIN_DGAIN
+	{0xA824, 0x00F6 , 1},     // AE_TRACK_MAX_DGAIN
+	{0x8404, 0x06   , 0},      // SEQ_CMD
+};
+//new ISO setting is over
+
+/* Camera functional setting values configured by user concept */
+struct mt9p111_userset {
+	signed int exposure_bias;	/* V4L2_CID_EXPOSURE */
+	unsigned int ae_lock;
+	unsigned int awb_lock;
+	unsigned int auto_wb;	/* V4L2_CID_AUTO_WHITE_BALANCE */
+	unsigned int manual_wb;	/* V4L2_CID_WHITE_BALANCE_PRESET */
+	unsigned int wb_temp;	/* V4L2_CID_WHITE_BALANCE_TEMPERATURE */
+	unsigned int effect;	/* Color FX (AKA Color tone) */
+	unsigned int contrast;	/* V4L2_CID_CONTRAST */
+	unsigned int saturation;	/* V4L2_CID_SATURATION */
+	unsigned int sharpness;		/* V4L2_CID_SHARPNESS */
+	unsigned int glamour;
+};
+
+
+
+/*
+ * S5K4BA register structure : 2bytes address, 2bytes value
+ * retry on write failure up-to 5 times
+ */
+
+enum mt9p111_context {
+	HIGHPOWER = 0,
+	LOWPOWER,
+};
+
+struct mt9p111 {
+	struct v4l2_subdev subdev;
+	int model;	/* V4L2_IDENT_MT9M11x* codes from v4l2-chip-ident.h */
+	enum mt9p111_context context;
+	struct v4l2_rect rect;
+	u32 pixfmt;
+	unsigned int gain;
+	unsigned char autoexposure;
+	unsigned char datawidth;
+	unsigned int powered:1;
+	unsigned int hflip:1;
+	unsigned int vflip:1;
+	unsigned int swap_rgb_even_odd:1;
+	unsigned int swap_rgb_red_blue:1;
+	unsigned int swap_yuv_y_chromas:1;
+	unsigned int swap_yuv_cb_cr:1;
+	unsigned int autowhitebalance:1;
+	struct mt9p111_userset userset;
+
+	struct v4l2_pix_format pix;
+	struct v4l2_fract timeperframe;
+	int freq;	/* MCLK in KHz */
+	int is_mipi;
+	int isize;
+	int ver;
+	int fps;
+};
+
+extern int mt9p111_sensor_power(int on);
+
+static inline struct mt9p111 *to_mt9p111_sd(struct v4l2_subdev *subdev)
+{
+	return container_of(subdev, struct mt9p111, subdev);
+}
+
+
+static struct mt9p111 *to_mt9p111(const struct i2c_client *client)
+{
+	return container_of(i2c_get_clientdata(client), struct mt9p111, subdev);
+}
+
+static int reg_page_map_set(struct i2c_client *client, const u16 reg)
+{
+	int ret;
+	u16 page;
+	static int lastpage = -1;	/* PageMap cache value */
+
+	page = (reg >> 8);
+	if (page == lastpage)
+		return 0;
+	if (page > 2)
+		return -EINVAL;
+
+	ret = i2c_smbus_write_word_data(client, MT9P111_PAGE_MAP, swab16(page));
+	if (!ret)
+		lastpage = page;
+	return ret;
+}
+
+static int mt9p111_reg_read(struct i2c_client *client, const u16 reg)
+{
+#if 0
+	int ret;
+
+	ret = reg_page_map_set(client, reg);
+	if (!ret)
+		ret = swab16(i2c_smbus_read_word_data(client, reg & 0xff));
+
+	dev_dbg(&client->dev, "read  reg.%03x -> %04x\n", reg, ret);
+	return ret;
+#endif
+	__be16 buffer =0;
+	int rc, val;
+	u8 regaddr[2];
+	regaddr[0]= reg >> 8;
+	regaddr[1]= reg & 0xff;
+	
+
+	rc = i2c_master_send(client, regaddr, 2);
+	if (rc != 2)
+	{
+		//printk( "i2c i/o error:  read send rc == %d (should be 2)\n", rc);
+		//printk("reg=%x  %x %x \n", reg, regaddr[0], regaddr[1]);
+	}
+
+	//msleep(10);//Shanghai ewada mask for old I2C test code
+
+	rc = i2c_master_recv(client, (char *)&buffer, 2);
+	if (rc != 2)
+	{
+		//printk("i2c i/o error  in mt9p111_reg_read: rc == %d (should be 2)\n", rc);
+	}
+
+	val = be16_to_cpu(buffer);
+
+	//printk("mt9v011: read 0x%04x = 0x%04x :0x%04x\n", reg, val, buffer );
+
+	return val;
+}
+
+static int mt9p111_reg_read_byte(struct i2c_client *client, const u16 reg)
+{
+	u8 buffer =0;
+	int rc;
+	u8 regaddr[2];
+	regaddr[0]= reg >> 8;
+	regaddr[1]= reg & 0xff;
+	
+
+	rc = i2c_master_send(client, regaddr, 2);
+	if (rc != 2)
+	{
+		//printk( "i2c i/o error:  read send rc == %d (should be 2)\n", rc);
+		//printk("reg=%x  %x %x \n", reg, regaddr[0], regaddr[1]);
+	}
+
+	//msleep(10);//Shanghai ewada mask for old I2C test code
+
+
+	rc = i2c_master_recv(client, (char *)&buffer, 1);
+	if (rc != 2)
+	{
+		//printk("i2c i/o error  in mt9p111_reg_read: rc == %d (should be 2)\n", rc);
+	}
+
+	//val = be16_to_cpu(buffer);
+
+	//printk("mt9v011: read 0x%04x = 0x%04x :0x%04x\n", reg, val, buffer );
+
+	return buffer;
+}
+
+static int mt9p111_reg_write(struct i2c_client *client, const u16 reg,
+			     const u16 data)
+{
+#if 0
+	int ret;
+
+	ret = reg_page_map_set(client, reg);
+	if (!ret)
+		ret = i2c_smbus_write_word_data(client, reg & 0xff,
+						swab16(data));
+	dev_dbg(&client->dev, "write reg.%03x = %04x -> %d\n", reg, data, ret);
+	return ret;
+#endif
+
+	int rc; 
+	int num = 4;
+	u8 cmdbuf[4];
+	cmdbuf[0]= reg >> 8;
+	cmdbuf[1]= reg & 0xff;
+
+	cmdbuf[2] = data >> 8;
+	cmdbuf[3] = data & 0xff;
+
+	rc = i2c_master_send(client, cmdbuf, num);
+	if (rc != num)
+	{
+		printk("i2c i/o error in reg write : rc == %d (should be %d)\n", rc, num);
+		printk("reg%x = %x \n", reg, data);
+		printk("%02x :%02x :%02x :%02x", cmdbuf[0], cmdbuf[1], cmdbuf[2], cmdbuf[3]);
+	}
+
+	
+
+	return !(num==rc);
+}
+
+#ifdef CONFIG_MX100_IOCTL
+static struct i2c_client *g_mt9p111_i2c_client;
+
+int MT9P111_WRITE(unsigned int reg, unsigned int val)
+{
+	if(!g_mt9p111_i2c_client) return -1;
+	
+	return mt9p111_reg_write(g_mt9p111_i2c_client,reg,val);
+}
+
+
+int MT9P111_READ(unsigned int reg)
+{
+	if(!g_mt9p111_i2c_client) return -1;
+
+	return mt9p111_reg_read(g_mt9p111_i2c_client,reg);
+}
+
+#endif
+
+static int mt9p111_reg_write_16byte(struct i2c_client *client, const u16 reg,
+			     const u16 *data)
+{
+	int rc; 
+	int num = 18;
+	u8 cmdbuf[18];
+	if(data == NULL)
+	{
+		printk("mt9p111_reg_write_16byte NULL parameter!\n");
+		return -1;
+	}
+	cmdbuf[0]= reg >> 8;
+	cmdbuf[1]= reg & 0xff;
+
+	cmdbuf[2] = data[0] >> 8;
+	cmdbuf[3] = data[0] & 0xff;
+	
+	cmdbuf[4] = data[1] >> 8;
+	cmdbuf[5] = data[1] & 0xff;
+	
+	cmdbuf[6] = data[2] >> 8;
+	cmdbuf[7] = data[2] & 0xff;
+	
+	cmdbuf[8] = data[3] >> 8;
+	cmdbuf[9] = data[3] & 0xff;
+	
+	cmdbuf[10] = data[4] >> 8;
+	cmdbuf[11] = data[4] & 0xff;
+	
+	cmdbuf[12] = data[5] >> 8;
+	cmdbuf[13] = data[5] & 0xff;
+	
+	cmdbuf[14] = data[6] >> 8;
+	cmdbuf[15] = data[6] & 0xff;
+	
+	cmdbuf[16] = data[7] >> 8;
+	cmdbuf[17] = data[7] & 0xff;
+
+	rc = i2c_master_send(client, cmdbuf, num);
+	if (rc != num)
+	{
+		printk("mt9p111_reg_write_16byte i2c i/o error in reg write : rc == %d (should be %d)\n", rc, num);
+		printk("reg%x = %x \n", reg, data);
+		printk("%02x :%02x :%02x :%02x", cmdbuf[0], cmdbuf[1], cmdbuf[2], cmdbuf[3]);
+	}
+	return !(num==rc);
+}
+
+static int mt9p111_reg_write_byte(struct i2c_client *client, const u16 reg,
+			     const u8 data)
+{
+	int rc; 
+	int num = 3;
+	u8 cmdbuf[3];
+	cmdbuf[0]= reg >> 8;
+	cmdbuf[1]= reg & 0xff;
+
+	cmdbuf[2] = data;
+
+	rc = i2c_master_send(client, cmdbuf, num);
+	if (rc != num)
+	{
+		printk("i2c i/o error in reg write : rc == %d (should be %d)\n", rc, num);
+		printk("reg%x = %x \n", reg, data);
+		printk("%02x :%02x :%02x", cmdbuf[0], cmdbuf[1], cmdbuf[2]);
+	}
+
+	return !(num==rc);
+}
+
+static int mt9p111_reg_write_array(struct i2c_client *client, struct mt9p111_reg_cfg 	*p_array, int sizes)
+{
+	int i;
+	struct mt9p111_reg_cfg 	*p_reg = p_array;
+	for (i = 0; i < sizes; i++, p_reg++)
+	{
+		if (p_reg->flag)
+			mt9p111_reg_write(client, p_reg->addr, p_reg->val);
+		else//single byte write
+			mt9p111_reg_write_byte(client, p_reg->addr, (u8)p_reg->val);
+	}
+
+	
+	//printk(" p_array=%x %x sizes=%d jump =%d \n", p_array, p_reg, sizes, p_reg-p_array);
+
+	p_reg--;
+	//printk(" reg=0x%02x  val=0x%02x\n", p_reg->addr, p_reg->val);
+	return 0;
+}
+
+static int mt9p111_reg_write_burst_array(struct i2c_client *client, struct mt9p111_reg_cfg_burst 	*p_array, int sizes)
+{
+	int i;
+	struct mt9p111_reg_cfg_burst 	*p_reg = p_array;
+	for (i = 0; i < sizes; i++, p_reg++)
+	{
+			mt9p111_reg_write_16byte(client, p_reg->addr, p_reg->val);
+	}
+	return 0;
+}
+
+static int mt9p111_reg_set(struct i2c_client *client, const u16 reg,
+			   const u16 data)
+{
+	int ret;
+
+	ret = mt9p111_reg_read(client, reg);
+	if (ret >= 0)
+		ret = mt9p111_reg_write(client, reg, ret | data);
+	return ret;
+}
+
+static int mt9p111_reg_clear(struct i2c_client *client, const u16 reg,
+			     const u16 data)
+{
+	int ret;
+
+	ret = mt9p111_reg_read(client, reg);
+	return mt9p111_reg_write(client, reg, ret & ~data);
+}
+
+static int mt9p111_set_context(struct i2c_client *client,
+			       enum mt9p111_context ctxt)
+{
+	int valB = MT9P111_CTXT_CTRL_RESTART | MT9P111_CTXT_CTRL_DEFECTCOR_B
+		| MT9P111_CTXT_CTRL_RESIZE_B | MT9P111_CTXT_CTRL_CTRL2_B
+		| MT9P111_CTXT_CTRL_GAMMA_B | MT9P111_CTXT_CTRL_READ_MODE_B
+		| MT9P111_CTXT_CTRL_VBLANK_SEL_B
+		| MT9P111_CTXT_CTRL_HBLANK_SEL_B;
+	int valA = MT9P111_CTXT_CTRL_RESTART;
+
+	if (ctxt == HIGHPOWER)
+		return reg_write(CONTEXT_CONTROL, valB);
+	else
+		return reg_write(CONTEXT_CONTROL, valA);
+}
+
+static int mt9p111_setup_rect(struct i2c_client *client,
+			      struct v4l2_rect *rect)
+{
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+	int ret, is_raw_format;
+	int width = rect->width;
+	int height = rect->height;
+
+	if (mt9p111->pixfmt == V4L2_PIX_FMT_SBGGR8 ||
+	    mt9p111->pixfmt == V4L2_PIX_FMT_SBGGR16)
+		is_raw_format = 1;
+	else
+		is_raw_format = 0;
+
+	ret = reg_write(COLUMN_START, rect->left);
+	if (!ret)
+		ret = reg_write(ROW_START, rect->top);
+
+	if (is_raw_format) {
+		if (!ret)
+			ret = reg_write(WINDOW_WIDTH, width);
+		if (!ret)
+			ret = reg_write(WINDOW_HEIGHT, height);
+	} else {
+		if (!ret)
+			ret = reg_write(REDUCER_XZOOM_B, MT9P111_MAX_WIDTH);
+		if (!ret)
+			ret = reg_write(REDUCER_YZOOM_B, MT9P111_MAX_HEIGHT);
+		if (!ret)
+			ret = reg_write(REDUCER_XSIZE_B, width);
+		if (!ret)
+			ret = reg_write(REDUCER_YSIZE_B, height);
+		if (!ret)
+			ret = reg_write(REDUCER_XZOOM_A, MT9P111_MAX_WIDTH);
+		if (!ret)
+			ret = reg_write(REDUCER_YZOOM_A, MT9P111_MAX_HEIGHT);
+		if (!ret)
+			ret = reg_write(REDUCER_XSIZE_A, width);
+		if (!ret)
+			ret = reg_write(REDUCER_YSIZE_A, height);
+	}
+
+	return ret;
+}
+
+static int mt9p111_setup_pixfmt(struct i2c_client *client, u16 outfmt)
+{
+	int ret;
+
+	ret = reg_write(OUTPUT_FORMAT_CTRL2_A, outfmt);
+	if (!ret)
+		ret = reg_write(OUTPUT_FORMAT_CTRL2_B, outfmt);
+	return ret;
+}
+
+static int mt9p111_setfmt_bayer8(struct i2c_client *client)
+{
+	return mt9p111_setup_pixfmt(client, MT9P111_OUTFMT_PROCESSED_BAYER);
+}
+
+static int mt9p111_setfmt_bayer10(struct i2c_client *client)
+{
+	return mt9p111_setup_pixfmt(client, MT9P111_OUTFMT_BYPASS_IFP);
+}
+
+static int mt9p111_setfmt_rgb565(struct i2c_client *client)
+{
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+	int val = 0;
+
+	if (mt9p111->swap_rgb_red_blue)
+		val |= MT9P111_OUTFMT_SWAP_YCbCr_Cb_Cr;
+	if (mt9p111->swap_rgb_even_odd)
+		val |= MT9P111_OUTFMT_SWAP_RGB_EVEN;
+	val |= MT9P111_OUTFMT_RGB | MT9P111_OUTFMT_RGB565;
+
+	return mt9p111_setup_pixfmt(client, val);
+}
+
+static int mt9p111_setfmt_rgb555(struct i2c_client *client)
+{
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+	int val = 0;
+
+	if (mt9p111->swap_rgb_red_blue)
+		val |= MT9P111_OUTFMT_SWAP_YCbCr_Cb_Cr;
+	if (mt9p111->swap_rgb_even_odd)
+		val |= MT9P111_OUTFMT_SWAP_RGB_EVEN;
+	val |= MT9P111_OUTFMT_RGB | MT9P111_OUTFMT_RGB555;
+
+	return mt9p111_setup_pixfmt(client, val);
+}
+
+static int mt9p111_setfmt_yuv(struct i2c_client *client)
+{
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+	int val = 0;
+
+	if (mt9p111->swap_yuv_cb_cr)
+		val |= MT9P111_OUTFMT_SWAP_YCbCr_Cb_Cr;
+	if (mt9p111->swap_yuv_y_chromas)
+		val |= MT9P111_OUTFMT_SWAP_YCbCr_C_Y;
+
+	return mt9p111_setup_pixfmt(client, val);
+}
+
+static int mt9p111_leave_stanby(struct i2c_client *client)
+{
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+	int ret;
+	//int i;
+	//int val;
+#if 0
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+	int ret;
+
+	ret = reg_set(RESET, MT9P111_RESET_CHIP_ENABLE);
+	if (!ret)
+		mt9p111->powered = 1;
+#endif
+	mt9p111_reg_write(client, 0x0018,  0x4008);
+	msleep(10);
+	mt9p111_reg_write(client, 0x0010,  0x0340);
+
+	return ret;
+}
+
+static int mt9p111_enable(struct i2c_client *client)
+{
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+	int ret = 0;
+#if 0
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+	int ret;
+
+	ret = reg_set(RESET, MT9P111_RESET_CHIP_ENABLE);
+	if (!ret)
+		mt9p111->powered = 1;
+#endif
+	
+	return ret;
+}
+
+static int mt9p111_reset(struct i2c_client *client)
+{
+	int ret;
+
+	ret = reg_set(RESET, MT9P111_RESET_RESET_MODE);
+	if (!ret)
+		ret = reg_set(RESET, MT9P111_RESET_RESET_SOC);
+	if (!ret)
+		ret = reg_clear(RESET, MT9P111_RESET_RESET_MODE
+				| MT9P111_RESET_RESET_SOC);
+
+	return ret;
+}
+
+static unsigned long mt9p111_query_bus_param(struct soc_camera_device *icd)
+{
+	struct soc_camera_link *icl = to_soc_camera_link(icd);
+	unsigned long flags = SOCAM_MASTER | SOCAM_PCLK_SAMPLE_RISING |
+		SOCAM_HSYNC_ACTIVE_HIGH | SOCAM_VSYNC_ACTIVE_HIGH |
+		SOCAM_DATA_ACTIVE_HIGH | SOCAM_DATAWIDTH_8;
+	printk("..........%s line=%d \n", __FUNCTION__, __LINE__);
+
+	return soc_camera_apply_sensor_flags(icl, flags);
+}
+
+static int mt9p111_set_bus_param(struct soc_camera_device *icd, unsigned long f)
+{
+	return 0;
+}
+
+static int mt9p111_make_rect(struct i2c_client *client,
+			     struct v4l2_rect *rect)
+{
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+
+	if (mt9p111->pixfmt == V4L2_PIX_FMT_SBGGR8 ||
+	    mt9p111->pixfmt == V4L2_PIX_FMT_SBGGR16) {
+		/* Bayer format - even size lengths */
+		rect->width	= ALIGN(rect->width, 2);
+		rect->height	= ALIGN(rect->height, 2);
+		/* Let the user play with the starting pixel */
+	}
+	printk("..........%s line=%d \n", __FUNCTION__, __LINE__);
+	/* FIXME: the datasheet doesn't specify minimum sizes */
+	soc_camera_limit_side(&rect->left, &rect->width,
+		     MT9P111_MIN_DARK_COLS, 2, MT9P111_MAX_WIDTH);
+
+	soc_camera_limit_side(&rect->top, &rect->height,
+		     MT9P111_MIN_DARK_ROWS, 2, MT9P111_MAX_HEIGHT);
+
+	return mt9p111_setup_rect(client, rect);
+}
+
+static int mt9p111_s_crop(struct v4l2_subdev *sd, struct v4l2_crop *a)
+{
+	struct v4l2_rect rect = a->c;
+	struct i2c_client *client = sd->priv;
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+	int ret;
+
+	dev_dbg(&client->dev, "%s left=%d, top=%d, width=%d, height=%d\n",
+		__func__, rect.left, rect.top, rect.width, rect.height);
+	printk("..........%s line=%d \n", __FUNCTION__, __LINE__);
+
+	ret = mt9p111_make_rect(client, &rect);
+	if (!ret)
+		mt9p111->rect = rect;
+	return ret;
+}
+
+static int mt9p111_g_crop(struct v4l2_subdev *sd, struct v4l2_crop *a)
+{
+	struct i2c_client *client = sd->priv;
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+
+	a->c	= mt9p111->rect;
+	a->type	= V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+	return 0;
+}
+
+static int mt9p111_cropcap(struct v4l2_subdev *sd, struct v4l2_cropcap *a)
+{
+	a->bounds.left			= MT9P111_MIN_DARK_COLS;
+	a->bounds.top			= MT9P111_MIN_DARK_ROWS;
+	a->bounds.width			= MT9P111_MAX_WIDTH;
+	a->bounds.height		= MT9P111_MAX_HEIGHT;
+	a->defrect			= a->bounds;
+	a->type				= V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	a->pixelaspect.numerator	= 1;
+	a->pixelaspect.denominator	= 1;
+
+	return 0;
+}
+
+static int mt9p111_g_fmt(struct v4l2_subdev *sd, struct v4l2_format *f)
+{
+	struct i2c_client *client = sd->priv;
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+	struct v4l2_pix_format *pix = &f->fmt.pix;
+
+	pix->width		= mt9p111->rect.width;
+	pix->height		= mt9p111->rect.height;
+	pix->pixelformat	= mt9p111->pixfmt;
+	pix->field		= V4L2_FIELD_NONE;
+	pix->colorspace		= V4L2_COLORSPACE_SRGB;
+
+	return 0;
+}
+
+static int mt9p111_set_pixfmt(struct i2c_client *client, u32 pixfmt)
+{
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+	int ret;
+
+	switch (pixfmt) {
+	case V4L2_PIX_FMT_SBGGR8:
+		ret = mt9p111_setfmt_bayer8(client);
+		break;
+	case V4L2_PIX_FMT_SBGGR16:
+		ret = mt9p111_setfmt_bayer10(client);
+		break;
+	case V4L2_PIX_FMT_RGB555:
+		ret = mt9p111_setfmt_rgb555(client);
+		break;
+	case V4L2_PIX_FMT_RGB565:
+		ret = mt9p111_setfmt_rgb565(client);
+		break;
+	case V4L2_PIX_FMT_UYVY:
+		mt9p111->swap_yuv_y_chromas = 0;
+		mt9p111->swap_yuv_cb_cr = 0;
+		ret = mt9p111_setfmt_yuv(client);
+		break;
+	case V4L2_PIX_FMT_VYUY:
+		mt9p111->swap_yuv_y_chromas = 0;
+		mt9p111->swap_yuv_cb_cr = 1;
+		ret = mt9p111_setfmt_yuv(client);
+		break;
+	case V4L2_PIX_FMT_YUYV:
+		mt9p111->swap_yuv_y_chromas = 1;
+		mt9p111->swap_yuv_cb_cr = 0;
+		ret = mt9p111_setfmt_yuv(client);
+		break;
+	case V4L2_PIX_FMT_YVYU:
+		mt9p111->swap_yuv_y_chromas = 1;
+		mt9p111->swap_yuv_cb_cr = 1;
+		ret = mt9p111_setfmt_yuv(client);
+		break;
+	default:
+		dev_err(&client->dev, "Pixel format not handled : %x\n",
+			pixfmt);
+		ret = -EINVAL;
+	}
+
+	if (!ret)
+		mt9p111->pixfmt = pixfmt;
+
+	return ret;
+}
+
+
+static int mt9p111_s_fmt(struct v4l2_subdev *sd, struct v4l2_format *f)
+{
+	struct i2c_client *client = sd->priv;
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+	struct v4l2_pix_format *pix = &f->fmt.pix;
+	struct v4l2_rect rect = {
+		.left	= mt9p111->rect.left,
+		.top	= mt9p111->rect.top,
+		.width	= pix->width,
+		.height	= pix->height,
+	};
+	int ret;
+	int i, size, data;
+
+	dev_dbg(&client->dev,
+		"%s fmt=%x left=%d, top=%d, width=%d, height=%d\n", __func__,
+		pix->pixelformat, rect.left, rect.top, rect.width, rect.height);
+
+	if(camera_current_preview_width >320 && pix->width >320)
+	{
+		printk("mt9p111_s_fmt we do not do anything! wid: %d, height: %d\n", pix->width, pix->height);
+	}else if(camera_current_preview_width >320 && pix->width <=320)
+	{
+		printk("mt9p111_s_fmt want to output wid: %d, height: %d\n", pix->width, pix->height);
+		camera_current_preview_width = pix->width;
+		size = (sizeof(mt9p111_preview_1280960) / sizeof(mt9p111_preview_1280960[0]));
+		mt9p111_reg_write_array(client, mt9p111_preview_1280960, size);
+		//wait for the core ready
+		for (i = 0; i < 100; i++)
+		{
+			data = mt9p111_reg_read_byte(client, 0x8404);
+			if (data == 0x00)
+			{
+				break;
+			}
+			msleep(10);
+		}
+	}else if(camera_current_preview_width <= 320 && pix->width > 320)
+	{
+		printk("mt9p111_s_fmt want to output wid: %d, height: %d\n", pix->width, pix->height);
+		camera_current_preview_width = pix->width;
+		size = (sizeof(mt9p111_preview_1024768) / sizeof(mt9p111_preview_1024768[0]));
+		mt9p111_reg_write_array(client, mt9p111_preview_1024768, size);
+		//wait for the core ready
+		for (i = 0; i < 100; i++)
+		{
+			data = mt9p111_reg_read_byte(client, 0x8404);
+			if (data == 0x00)
+			{
+				break;
+			}
+			msleep(10);
+		}
+	}
+return 0;
+	ret = mt9p111_make_rect(client, &rect);
+	if (!ret)
+		ret = mt9p111_set_pixfmt(client, pix->pixelformat);
+	if (!ret)
+		mt9p111->rect = rect;
+	return ret;
+}
+
+static int mt9p111_try_fmt(struct v4l2_subdev *sd, struct v4l2_format *f)
+{
+	struct v4l2_pix_format *pix = &f->fmt.pix;
+	bool bayer = pix->pixelformat == V4L2_PIX_FMT_SBGGR8 ||
+		pix->pixelformat == V4L2_PIX_FMT_SBGGR16;
+
+	/*
+	 * With Bayer format enforce even side lengths, but let the user play
+	 * with the starting pixel
+	 */
+	 printk("..........%s line=%d \n", __FUNCTION__, __LINE__);
+
+	if (pix->height > MT9P111_MAX_HEIGHT)
+		pix->height = MT9P111_MAX_HEIGHT;
+	else if (pix->height < 2)
+		pix->height = 2;
+	else if (bayer)
+		pix->height = ALIGN(pix->height, 2);
+
+	if (pix->width > MT9P111_MAX_WIDTH)
+		pix->width = MT9P111_MAX_WIDTH;
+	else if (pix->width < 2)
+		pix->width = 2;
+	else if (bayer)
+		pix->width = ALIGN(pix->width, 2);
+
+	return 0;
+}
+
+static int mt9p111_g_chip_ident(struct v4l2_subdev *sd,
+				struct v4l2_dbg_chip_ident *id)
+{
+	struct i2c_client *client = sd->priv;
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+
+	if (id->match.type != V4L2_CHIP_MATCH_I2C_ADDR)
+		return -EINVAL;
+
+	if (id->match.addr != client->addr)
+		return -ENODEV;
+
+	id->ident	= mt9p111->model;
+	id->revision	= 0;
+
+	return 0;
+}
+
+#ifdef CONFIG_VIDEO_ADV_DEBUG
+static int mt9p111_g_register(struct v4l2_subdev *sd,
+			      struct v4l2_dbg_register *reg)
+{
+	struct i2c_client *client = sd->priv;
+	int val;
+	printk("..........%s line=%d \n", __FUNCTION__, __LINE__);
+
+	if (reg->match.type != V4L2_CHIP_MATCH_I2C_ADDR || reg->reg > 0x2ff)
+		return -EINVAL;
+	if (reg->match.addr != client->addr)
+		return -ENODEV;
+
+	val = mt9p111_reg_read(client, reg->reg);
+	reg->size = 2;
+	reg->val = (u64)val;
+
+	if (reg->val > 0xffff)
+		return -EIO;
+
+	return 0;
+}
+
+static int mt9p111_s_register(struct v4l2_subdev *sd,
+			      struct v4l2_dbg_register *reg)
+{
+	struct i2c_client *client = sd->priv;
+
+	if (reg->match.type != V4L2_CHIP_MATCH_I2C_ADDR || reg->reg > 0x2ff)
+		return -EINVAL;
+
+	if (reg->match.addr != client->addr)
+		return -ENODEV;
+
+	if (mt9p111_reg_write(client, reg->reg, reg->val) < 0)
+		return -EIO;
+
+	return 0;
+}
+#endif
+
+static const struct v4l2_queryctrl mt9p111_controls[] = {
+	{
+		.id		= V4L2_CID_VFLIP,
+		.type		= V4L2_CTRL_TYPE_BOOLEAN,
+		.name		= "Flip Verticaly",
+		.minimum	= 0,
+		.maximum	= 1,
+		.step		= 1,
+		.default_value	= 0,
+	}, {
+		.id		= V4L2_CID_HFLIP,
+		.type		= V4L2_CTRL_TYPE_BOOLEAN,
+		.name		= "Flip Horizontaly",
+		.minimum	= 0,
+		.maximum	= 1,
+		.step		= 1,
+		.default_value	= 0,
+	}, {	/* gain = 1/32*val (=>gain=1 if val==32) */
+		.id		= V4L2_CID_GAIN,
+		.type		= V4L2_CTRL_TYPE_INTEGER,
+		.name		= "Gain",
+		.minimum	= 0,
+		.maximum	= 63 * 2 * 2,
+		.step		= 1,
+		.default_value	= 32,
+		.flags		= V4L2_CTRL_FLAG_SLIDER,
+	}, {
+		.id		= V4L2_CID_EXPOSURE_AUTO,
+		.type		= V4L2_CTRL_TYPE_BOOLEAN,
+		.name		= "Auto Exposure",
+		.minimum	= 0,
+		.maximum	= 1,
+		.step		= 1,
+		.default_value	= 1,
+	}
+};
+
+static int mt9p111_resume(struct soc_camera_device *icd);
+static int mt9p111_suspend(struct soc_camera_device *icd, pm_message_t state);
+
+static struct soc_camera_ops mt9p111_ops = {
+	.suspend		= mt9p111_suspend,
+	.resume			= mt9p111_resume,
+	.query_bus_param	= mt9p111_query_bus_param,
+	.set_bus_param		= mt9p111_set_bus_param,
+	.controls		= mt9p111_controls,
+	.num_controls		= ARRAY_SIZE(mt9p111_controls),
+};
+
+static int mt9p111_set_flip(struct i2c_client *client, int flip, int mask)
+{
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+	int ret;
+
+	if (mt9p111->context == HIGHPOWER) {
+		if (flip)
+			ret = reg_set(READ_MODE_B, mask);
+		else
+			ret = reg_clear(READ_MODE_B, mask);
+	} else {
+		if (flip)
+			ret = reg_set(READ_MODE_A, mask);
+		else
+			ret = reg_clear(READ_MODE_A, mask);
+	}
+
+	return ret;
+}
+
+static int mt9p111_get_global_gain(struct i2c_client *client)
+{
+	int data;
+
+	data = reg_read(GLOBAL_GAIN);
+	if (data >= 0)
+		return (data & 0x2f) * (1 << ((data >> 10) & 1)) *
+			(1 << ((data >> 9) & 1));
+	return data;
+}
+
+static int mt9p111_set_global_gain(struct i2c_client *client, int gain)
+{
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+	u16 val;
+
+	if (gain > 63 * 2 * 2)
+		return -EINVAL;
+
+	mt9p111->gain = gain;
+	if ((gain >= 64 * 2) && (gain < 63 * 2 * 2))
+		val = (1 << 10) | (1 << 9) | (gain / 4);
+	else if ((gain >= 64) && (gain < 64 * 2))
+		val = (1 << 9) | (gain / 2);
+	else
+		val = gain;
+
+	return reg_write(GLOBAL_GAIN, val);
+}
+
+static int mt9p111_set_autoexposure(struct i2c_client *client, int on)
+{
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+	int ret;
+
+	return 0;
+	
+	if (on)
+		ret = reg_set(OPER_MODE_CTRL, MT9P111_OPMODE_AUTOEXPO_EN);
+	else
+		ret = reg_clear(OPER_MODE_CTRL, MT9P111_OPMODE_AUTOEXPO_EN);
+
+	if (!ret)
+		mt9p111->autoexposure = on;
+
+	return ret;
+}
+
+static int mt9p111_set_autowhitebalance(struct i2c_client *client, int on)
+{
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+	int ret;
+
+	if (on)
+		ret = reg_set(OPER_MODE_CTRL, MT9P111_OPMODE_AUTOWHITEBAL_EN);
+	else
+		ret = reg_clear(OPER_MODE_CTRL, MT9P111_OPMODE_AUTOWHITEBAL_EN);
+
+	if (!ret)
+		mt9p111->autowhitebalance = on;
+
+	return ret;
+}
+
+static int mt9p111_set_whitebalance(struct i2c_client *client, int whitebalance)
+{
+	int size;
+	int data;
+	int i;
+
+	switch(whitebalance)
+	{
+	case MT9P111_WB_AUTO:
+		size = (sizeof(mt9p111_wb_auto_1) / sizeof(mt9p111_wb_auto_1[0]));
+		mt9p111_reg_write_array(client, mt9p111_wb_auto_1, size);
+		break;
+	case MT9P111_WB_CLOUDY:
+		size = (sizeof(mt9p111_wb_cloudy_1) / sizeof(mt9p111_wb_cloudy_1[0]));
+		mt9p111_reg_write_array(client, mt9p111_wb_cloudy_1, size);
+		break;
+	case MT9P111_WB_DAYLIGHT:
+		size = (sizeof(mt9p111_wb_daylight_1) / sizeof(mt9p111_wb_daylight_1[0]));
+		mt9p111_reg_write_array(client, mt9p111_wb_daylight_1, size);
+		break;
+	case MT9P111_WB_FLUORESCENT:
+		size = (sizeof(mt9p111_wb_fluorescent_1) / sizeof(mt9p111_wb_fluorescent_1[0]));
+		mt9p111_reg_write_array(client, mt9p111_wb_fluorescent_1, size);
+		break;
+	case MT9P111_WB_INCANDESCENT:
+		size = (sizeof(mt9p111_wb_incandescent_1) / sizeof(mt9p111_wb_incandescent_1[0]));
+		mt9p111_reg_write_array(client, mt9p111_wb_incandescent_1, size);
+		break;
+	}
+	msleep(10);
+
+	for (i=0; i<100; i++)
+	{
+		data = mt9p111_reg_read_byte(client, 0x8404);
+		if (0x00 == data)
+		{
+			break;
+		}
+		msleep(10);
+	}
+	//msleep(50);
+
+	switch(whitebalance)
+	{
+	case MT9P111_WB_AUTO:
+		size = (sizeof(mt9p111_wb_auto_2) / sizeof(mt9p111_wb_auto_2[0]));
+		mt9p111_reg_write_array(client, mt9p111_wb_auto_2, size);
+		break;
+	case MT9P111_WB_CLOUDY:
+		size = (sizeof(mt9p111_wb_cloudy_2) / sizeof(mt9p111_wb_cloudy_2[0]));
+		mt9p111_reg_write_array(client, mt9p111_wb_cloudy_2, size);
+		break;
+	case MT9P111_WB_DAYLIGHT:
+		size = (sizeof(mt9p111_wb_daylight_2) / sizeof(mt9p111_wb_daylight_2[0]));
+		mt9p111_reg_write_array(client, mt9p111_wb_daylight_2, size);
+		break;
+	case MT9P111_WB_FLUORESCENT:
+		size = (sizeof(mt9p111_wb_fluorescent_2) / sizeof(mt9p111_wb_fluorescent_2[0]));
+		mt9p111_reg_write_array(client, mt9p111_wb_fluorescent_2, size);
+		break;
+	case MT9P111_WB_INCANDESCENT:
+		size = (sizeof(mt9p111_wb_incandescent_2) / sizeof(mt9p111_wb_incandescent_2[0]));
+		mt9p111_reg_write_array(client, mt9p111_wb_incandescent_2, size);
+		break;
+	}
+	msleep(10);
+
+	for (i=0; i<100; i++)
+	{
+		data = mt9p111_reg_read_byte(client, 0x8404);
+		if (0x00 == data)
+		{
+			break;
+		}
+		msleep(10);
+	}
+
+	return 0;
+}
+
+static int mt9p111_set_bright(struct i2c_client *client, int bright)
+{
+	int size;
+
+	switch (bright)
+	{
+	case MT9P111_BRIGHT_REDUCE2:
+		size = (sizeof(mt9p111_bright_reduce2) / sizeof(mt9p111_bright_reduce2[0]));
+		mt9p111_reg_write_array(client, mt9p111_bright_reduce2, size);
+		break;
+	case MT9P111_BRIGHT_REDUCE1_5:
+		size = (sizeof(mt9p111_bright_reduce1_5) / sizeof(mt9p111_bright_reduce1_5[0]));
+		mt9p111_reg_write_array(client, mt9p111_bright_reduce1_5, size);
+		break;
+	case MT9P111_BRIGHT_REDUCE1:
+		size = (sizeof(mt9p111_bright_reduce1) / sizeof(mt9p111_bright_reduce1[0]));
+		mt9p111_reg_write_array(client, mt9p111_bright_reduce1, size);
+		break;
+	case MT9P111_BRIGHT_REDUCE0_5:
+		size = (sizeof(mt9p111_bright_reduce0_5) / sizeof(mt9p111_bright_reduce0_5[0]));
+		mt9p111_reg_write_array(client, mt9p111_bright_reduce0_5, size);
+		break;
+	case MT9P111_BRIGHT_0:
+		size = (sizeof(mt9p111_bright_0) / sizeof(mt9p111_bright_0[0]));
+		mt9p111_reg_write_array(client, mt9p111_bright_0, size);
+		break;
+	case MT9P111_BRIGHT_INCREASE0_5:
+		size = (sizeof(mt9p111_bright_increase0_5) / sizeof(mt9p111_bright_increase0_5[0]));
+		mt9p111_reg_write_array(client, mt9p111_bright_increase0_5, size);
+		break;
+	case MT9P111_BRIGHT_INCREASE1:
+		size = (sizeof(mt9p111_bright_increase1) / sizeof(mt9p111_bright_increase1[0]));
+		mt9p111_reg_write_array(client, mt9p111_bright_increase1, size);
+		break;
+	case MT9P111_BRIGHT_INCREASE1_5:
+		size = (sizeof(mt9p111_bright_increase1_5) / sizeof(mt9p111_bright_increase1_5[0]));
+		mt9p111_reg_write_array(client, mt9p111_bright_increase1_5, size);
+		break;
+	case MT9P111_BRIGHT_INCREASE2:
+		size = (sizeof(mt9p111_bright_increase2) / sizeof(mt9p111_bright_increase2[0]));
+		mt9p111_reg_write_array(client, mt9p111_bright_increase2, size);
+		break;
+	}
+
+	return 0;
+}
+
+extern void fimc_cap_set_cam_source(int width, int height, int cap);
+
+static int mt9p111_set_capture_resolution(struct i2c_client *client, int captureresolution)
+{
+	int i;
+	int size;
+	int data;
+
+
+	switch (captureresolution)
+	{
+	case MT9P111_CAPTURE_RESOLUTION_2592X1944:
+		size = (sizeof(mt9p111_capture_resolution_2592x1944) / sizeof(mt9p111_capture_resolution_2592x1944[0]));
+		mt9p111_reg_write_array(client, mt9p111_capture_resolution_2592x1944, size);
+		fimc_cap_set_cam_source(2592, 1944, 1);
+		break;
+	case MT9P111_CAPTURE_RESOLUTION_2048X1536:
+		size = (sizeof(mt9p111_capture_resolution_2048x1536) / sizeof(mt9p111_capture_resolution_2048x1536[0]));
+		mt9p111_reg_write_array(client, mt9p111_capture_resolution_2048x1536, size);
+		fimc_cap_set_cam_source(2048, 1536, 1);
+		break;
+	case MT9P111_CAPTURE_RESOLUTION_1600X1200:
+		size = (sizeof(mt9p111_capture_resolution_1600x1200) / sizeof(mt9p111_capture_resolution_1600x1200[0]));
+		mt9p111_reg_write_array(client, mt9p111_capture_resolution_1600x1200, size);
+		fimc_cap_set_cam_source(1600, 1200, 1);
+		break;
+	case MT9P111_CAPTURE_RESOLUTION_1296X972:
+		size = (sizeof(mt9p111_capture_resolution_1296x972) / sizeof(mt9p111_capture_resolution_1296x972[0]));
+		mt9p111_reg_write_array(client, mt9p111_capture_resolution_1296x972, size);
+		fimc_cap_set_cam_source(1296, 972, 1);
+		break;
+	case MT9P111_CAPTURE_RESOLUTION_1280X960:
+		size = (sizeof(mt9p111_capture_resolution_1280x960) / sizeof(mt9p111_capture_resolution_1280x960[0]));
+		mt9p111_reg_write_array(client, mt9p111_capture_resolution_1280x960, size);
+		fimc_cap_set_cam_source(1280, 960, 1);
+		break;
+	case MT9P111_CAPTURE_RESOLUTION_1280X720:
+		size = (sizeof(mt9p111_capture_resolution_1280x720) / sizeof(mt9p111_capture_resolution_1280x720[0]));
+		mt9p111_reg_write_array(client, mt9p111_capture_resolution_1280x720, size);
+		fimc_cap_set_cam_source(1280, 720, 1);
+		break;
+	case MT9P111_CAPTURE_RESOLUTION_1024X768:
+		size = (sizeof(mt9p111_capture_resolution_1024x768) / sizeof(mt9p111_capture_resolution_1024x768[0]));
+		mt9p111_reg_write_array(client, mt9p111_capture_resolution_1024x768, size);
+		fimc_cap_set_cam_source(1024, 768, 1);
+		break;
+	case MT9P111_CAPTURE_RESOLUTION_800X600:
+		size = (sizeof(mt9p111_capture_resolution_800x600) / sizeof(mt9p111_capture_resolution_800x600[0]));
+		mt9p111_reg_write_array(client, mt9p111_capture_resolution_800x600, size);
+		fimc_cap_set_cam_source(800, 600, 1);
+		break;
+	case MT9P111_CAPTURE_RESOLUTION_640X480:
+		size = (sizeof(mt9p111_capture_resolution_640x480) / sizeof(mt9p111_capture_resolution_640x480[0]));
+		mt9p111_reg_write_array(client, mt9p111_capture_resolution_640x480, size);
+		fimc_cap_set_cam_source(640, 480, 1);
+		break;
+	case MT9P111_CAPTURE_RESOLUTION_512X384:
+		size = (sizeof(mt9p111_capture_resolution_512x384) / sizeof(mt9p111_capture_resolution_512x384[0]));
+		mt9p111_reg_write_array(client, mt9p111_capture_resolution_512x384, size);
+		fimc_cap_set_cam_source(512, 384, 1);
+		break;
+	case MT9P111_CAPTURE_RESOLUTION_400X300:
+		size = (sizeof(mt9p111_capture_resolution_400x300) / sizeof(mt9p111_capture_resolution_400x300[0]));
+		mt9p111_reg_write_array(client, mt9p111_capture_resolution_400x300, size);
+		fimc_cap_set_cam_source(400, 300, 1);
+		break;
+	}
+	//msleep(10);
+
+	for (i=0; i<100; i++)
+	{
+		msleep(20);
+		data = mt9p111_reg_read_byte(client, 0x8404);
+		//printk("%d\n", data);
+		if (0x00 == data)	{
+
+			break;
+		}
+		msleep(20);
+		
+	}
+
+#if 0
+	size = (sizeof(mt9p111_capture_power_post) / sizeof(mt9p111_capture_power_post[0]));
+	mt9p111_reg_write_array(client, mt9p111_capture_power_post, size);
+	//msleep(10);
+
+	for (i=0; i<100; i++)
+	{
+		data = mt9p111_reg_read_byte(client, 0x8404);
+
+		if (0x00 == data)
+		{
+			break;
+		}
+		msleep(10);
+	}
+
+#endif
+#if 1
+	size = (sizeof(mt9p111_capture_power_post2) / sizeof(mt9p111_capture_power_post2[0]));
+	mt9p111_reg_write_array(client, mt9p111_capture_power_post2, size);
+	//msleep(10);
+
+	for (i=0; i<100; i++)
+	{
+		msleep(30);
+		data = mt9p111_reg_read_byte(client, 0x8404);
+
+		if (0x00 == data)
+		{
+			break;
+		}
+		msleep(40);
+	}
+#endif
+
+	return 0;
+}
+static int mt9p111_set_preview_mode(struct i2c_client *client, int capture)
+{
+	int size = 0;
+	int i1,i2,i3;
+	int data, data2;
+	i1 = i2 = i3 = 0;
+	if (capture == 0)
+	{
+		size = (sizeof(mt9p111_preview_power) / sizeof(mt9p111_preview_power[0]));
+		mt9p111_reg_write_array(client, mt9p111_preview_power, size);
+		for (i1=0; i1<100; i1++)
+		{
+			data = mt9p111_reg_read_byte(client, 0x8404);
+			if (0x00 == data)	{
+				break;
+			}	
+			msleep(10);
+		}
+		
+		size = (sizeof(mt9p111_analog_control) / sizeof(mt9p111_analog_control[0]));//FAE request
+		mt9p111_reg_write_array(client, mt9p111_analog_control, size);
+		
+#if 0   //removed by FAE 2011.03.17
+		size = (sizeof(mt9p111_lens_infinity) / sizeof(mt9p111_lens_infinity[0]));
+		mt9p111_reg_write_array(client, mt9p111_lens_infinity, size);
+#endif
+		for (i1=0; i1<100; i1++)
+		{
+			int data = mt9p111_reg_read_byte(client, 0x8404);
+			if (0x00 == data)	{
+				break;
+			}	
+			msleep(10);
+		}
+
+#if 0
+		size = (sizeof(mt9p111_analog_control2) / sizeof(mt9p111_analog_control2[0]));
+		mt9p111_reg_write_array(client, mt9p111_analog_control2, size);
+		for (i1=0; i1<100; i1++)
+		{
+			int data = mt9p111_reg_read_byte(client, 0x8404);
+			if (0x00 == data)	{
+				break;
+			}	
+			msleep(10);
+		}
+#endif
+	}
+	else 
+	{
+		size = (sizeof(mt9p111_capture_power) / sizeof(mt9p111_capture_power[0]));
+		mt9p111_reg_write_array(client, mt9p111_capture_power, size);
+		for (i2=0; i2<255; i2++)
+		{
+			data2 = mt9p111_reg_read_byte(client, 0x8404);
+			if (0x00 == data2)	{
+				break;
+			}
+			msleep(10);
+		}
+#if 0
+		size = (sizeof(mt9p111_capture_power_post) / sizeof(mt9p111_capture_power_post[0]));
+		mt9p111_reg_write_array(client, mt9p111_capture_power_post, size);
+		for (i3=0; i3<255; i3++)
+		{
+			data = mt9p111_reg_read_byte(client, 0x8404);
+			
+			if (0x00 == data)	{
+				break;
+			}
+			msleep(10);
+		}
+#endif
+		size = (sizeof(mt9p111_capture_power_post2) / sizeof(mt9p111_capture_power_post2[0]));
+		mt9p111_reg_write_array(client, mt9p111_capture_power_post2, size);
+		for (i2=0; i2<255; i2++)
+		{
+			data2 = mt9p111_reg_read_byte(client, 0x8404);
+			if (0x00 == data2)	{
+				break;
+			}
+			msleep(10);
+		}
+	}
+
+	return 0;
+}
+
+static int mt9p111_set_af_full_scan_mode(struct i2c_client *client)
+{
+	int size;
+
+	size = (sizeof(af_full_scan_mode) / sizeof(af_full_scan_mode[0]));
+	mt9p111_reg_write_array(client, af_full_scan_mode, size);
+
+	return 0;
+}
+
+static int mt9p111_set_af_continuous_mode(struct i2c_client *client)
+{
+	int size;
+	int data;
+	int i;
+
+	size = (sizeof(af_continuous_mode_1) / sizeof(af_continuous_mode_1[0]));
+	mt9p111_reg_write_array(client, af_continuous_mode_1, size);
+	msleep(10);
+
+	for (i=0; i<100; i++)
+	{
+		data = mt9p111_reg_read_byte(client, 0x8404);
+		if (0x00 == data)
+		{
+			break;
+		}
+		msleep(10);
+	}
+
+	size = (sizeof(af_continuous_mode_2) / sizeof(af_continuous_mode_2[0]));
+	mt9p111_reg_write_array(client, af_continuous_mode_2, size);
+	msleep(10);
+
+	for (i=0; i<100; i++)
+	{
+		data = mt9p111_reg_read_byte(client, 0x8404);
+		if (0x00 == data)
+		{
+			break;
+		}
+		msleep(10);
+	}
+
+	size = (sizeof(af_continuous_mode_3) / sizeof(af_continuous_mode_3[0]));
+	mt9p111_reg_write_array(client, af_continuous_mode_3, size);
+
+	return 0;
+}
+
+static int mt9p111_set_full_scan_auto_focus_execution(struct i2c_client *client)
+{
+	int size;
+	int data;
+	int i;
+
+	size = (sizeof(mt9p111_full_scan_auto_focus_execution_1) / sizeof(mt9p111_full_scan_auto_focus_execution_1[0]));
+	mt9p111_reg_write_array(client, mt9p111_full_scan_auto_focus_execution_1, size);
+	msleep(10);
+
+	for (i=0; i<100; i++)
+	{
+		data = mt9p111_reg_read_byte(client, 0x8404);
+		if (0x00 == data)
+		{
+			break;
+		}
+		msleep(10);
+	}
+
+	size = (sizeof(mt9p111_full_scan_auto_focus_execution_2) / sizeof(mt9p111_full_scan_auto_focus_execution_2[0]));
+	mt9p111_reg_write_array(client, mt9p111_full_scan_auto_focus_execution_2, size);
+
+	return 0;
+}
+
+static int mt9t111_get_autofocus_status(struct i2c_client *client)
+{
+
+//wait autofocus finish, how about the time
+		return mt9p111_reg_read_byte(client, 0xB006);
+}
+
+
+static int mt9t111_set_sf_mode(struct i2c_client *client, int sf_mode)
+{
+	int size;
+	int data;
+	int i;
+
+	switch (sf_mode)
+	{
+	case MT9T111_DEFAULT_AF_AREA:
+		size = (sizeof(mt9t111_default_af_area) / sizeof(mt9t111_default_af_area[0]));
+		mt9p111_reg_write_array(client, mt9t111_default_af_area, size);
+		break;
+	case MT9P111_SF_UP_LEFT:
+		size = (sizeof(mt9p111_sf_up_left) / sizeof(mt9p111_sf_up_left[0]));
+		mt9p111_reg_write_array(client, mt9p111_sf_up_left, size);
+		break;
+	case MT9P111_SF_UP_MID:
+		size = (sizeof(mt9p111_sf_up_mid) / sizeof(mt9p111_sf_up_mid[0]));
+		mt9p111_reg_write_array(client, mt9p111_sf_up_mid, size);
+		break;
+	case MT9P111_SF_UP_RIGHT:
+		size = (sizeof(mt9p111_sf_up_right) / sizeof(mt9p111_sf_up_right[0]));
+		mt9p111_reg_write_array(client, mt9p111_sf_up_right, size);
+		break;
+	case MT9P111_SF_MID_LEFT:
+		size = (sizeof(mt9p111_sf_mid_left) / sizeof(mt9p111_sf_mid_left[0]));
+		mt9p111_reg_write_array(client, mt9p111_sf_mid_left, size);
+		break;
+	case MT9P111_SF_MID_MID:
+		size = (sizeof(mt9p111_sf_mid_mid) / sizeof(mt9p111_sf_mid_mid[0]));
+		mt9p111_reg_write_array(client, mt9p111_sf_mid_mid, size);
+		break;
+	case MT9P111_SF_MID_RIGHT:
+		size = (sizeof(mt9p111_sf_mid_right) / sizeof(mt9p111_sf_mid_right[0]));
+		mt9p111_reg_write_array(client, mt9p111_sf_mid_right, size);
+		break;
+	case MT9P111_SF_DOWN_LEFT:
+		size = (sizeof(mt9p111_sf_down_left) / sizeof(mt9p111_sf_down_left[0]));
+		mt9p111_reg_write_array(client, mt9p111_sf_down_left, size);
+		break;
+	case MT9P111_SF_DOWN_MID:
+		size = (sizeof(mt9p111_sf_down_mid) / sizeof(mt9p111_sf_down_mid[0]));
+		mt9p111_reg_write_array(client, mt9p111_sf_down_mid, size);
+		break;
+	case MT9P111_SF_DOWN_RIGHT:
+		size = (sizeof(mt9p111_sf_down_right) / sizeof(mt9p111_sf_down_right[0]));
+		mt9p111_reg_write_array(client, mt9p111_sf_down_right, size);
+		break;
+	}
+	msleep(10);
+
+	for (i=0; i<100; i++)
+	{
+		data = mt9p111_reg_read_byte(client, 0x8404);
+		if (0x00 == data)
+		{
+			break;
+		}
+		msleep(10);
+	}
+
+	return 0;
+}
+
+/* Manual Focus
+ * marco = 1step
+ * 1M ~ macro = 8step ~ 1step
+ * 1M = 8step            
+ * Infinity = 10step
+ * MT9P111_MANUAL_FOCUS_1
+ */
+static int mt9t111_set_manual_focus(struct i2c_client *client, int manual_focus)
+{
+	int size;
+	int data;
+	int i;
+
+	struct mt9p111_reg_cfg mt9p111_manual_focus[]=
+	{
+		{0x098E, 0x8419, 1}, // LOGICAL_ADDRESS_ACCESS [SEQ_STATE_CFG_1_AF]
+		{0x8419, 0x01, 0}, // SEQ_STATE_CFG_1_AF
+		{0x8404, 0x05, 0}, // SEQ_CMD
+	};
+	size = (sizeof(mt9p111_manual_focus) / sizeof(mt9p111_manual_focus[0]));
+	mt9p111_reg_write_array(client, mt9p111_manual_focus, size);
+	msleep(10);
+
+	for (i=0; i<100; i++)
+	{
+		data = mt9p111_reg_read_byte(client, 0x8404);
+		if (0x00 == data)
+		{
+			break;
+		}
+		msleep(10);
+	}
+
+	switch (manual_focus)
+	{
+	case MT9P111_MANUAL_FOCUS_1:
+		size = (sizeof(mt9p111_manual_focus_1) / sizeof(mt9p111_manual_focus_1[0]));
+		mt9p111_reg_write_array(client, mt9p111_manual_focus_1, size);
+		break;
+	case MT9P111_MANUAL_FOCUS_2:
+		size = (sizeof(mt9p111_manual_focus_2) / sizeof(mt9p111_manual_focus_2[0]));
+		mt9p111_reg_write_array(client, mt9p111_manual_focus_2, size);
+		break;
+	case MT9P111_MANUAL_FOCUS_3:
+		size = (sizeof(mt9p111_manual_focus_3) / sizeof(mt9p111_manual_focus_3[0]));
+		mt9p111_reg_write_array(client, mt9p111_manual_focus_3, size);
+		break;
+	case MT9P111_MANUAL_FOCUS_4:
+		size = (sizeof(mt9p111_manual_focus_4) / sizeof(mt9p111_manual_focus_4[0]));
+		mt9p111_reg_write_array(client, mt9p111_manual_focus_4, size);
+		break;
+	case MT9P111_MANUAL_FOCUS_5:
+		size = (sizeof(mt9p111_manual_focus_5) / sizeof(mt9p111_manual_focus_5[0]));
+		mt9p111_reg_write_array(client, mt9p111_manual_focus_5, size);
+		break;
+	case MT9P111_MANUAL_FOCUS_6:
+		size = (sizeof(mt9p111_manual_focus_6) / sizeof(mt9p111_manual_focus_6[0]));
+		mt9p111_reg_write_array(client, mt9p111_manual_focus_6, size);
+		break;
+	case MT9P111_MANUAL_FOCUS_7:
+		size = (sizeof(mt9p111_manual_focus_7) / sizeof(mt9p111_manual_focus_7[0]));
+		mt9p111_reg_write_array(client, mt9p111_manual_focus_7, size);
+		break;
+	case MT9P111_MANUAL_FOCUS_8:
+		size = (sizeof(mt9p111_manual_focus_8) / sizeof(mt9p111_manual_focus_8[0]));
+		mt9p111_reg_write_array(client, mt9p111_manual_focus_8, size);
+		break;
+	case MT9P111_MANUAL_FOCUS_9:
+		size = (sizeof(mt9p111_manual_focus_9) / sizeof(mt9p111_manual_focus_9[0]));
+		mt9p111_reg_write_array(client, mt9p111_manual_focus_9, size);
+		break;
+	case MT9P111_MANUAL_FOCUS_10:
+		size = (sizeof(mt9p111_manual_focus_10) / sizeof(mt9p111_manual_focus_10[0]));
+		mt9p111_reg_write_array(client, mt9p111_manual_focus_10, size);
+		break;
+	}
+
+	return 0;
+}
+
+static int mt9t111_set_focus(struct i2c_client *client, int focus)
+{
+/*
+	switch (focus)
+	{
+	case AF_FULL_SCAN_MODE:
+		mt9p111_set_af_full_scan_mode(client);
+		break;
+	case AF_CONTINUOUS_MODE:
+		mt9p111_set_af_continuous_mode(client);
+		break;
+	case FULL_SCAN_AUTO_FOCUS_EXECUTION:
+		mt9p111_set_full_scan_auto_focus_execution(client);
+		break;
+	case MT9T111_DEFAULT_AF_AREA:
+	case MT9P111_SF_UP_LEFT:
+	case MT9P111_SF_UP_MID:
+	case MT9P111_SF_UP_RIGHT:
+	case MT9P111_SF_MID_LEFT:
+	case MT9P111_SF_MID_MID:
+	case MT9P111_SF_MID_RIGHT:
+	case MT9P111_SF_DOWN_LEFT:
+	case MT9P111_SF_DOWN_MID:
+	case MT9P111_SF_DOWN_RIGHT:
+		mt9t111_set_sf_mode(client, focus);
+		break;
+	case MT9P111_MANUAL_FOCUS_1:
+	case MT9P111_MANUAL_FOCUS_2:
+	case MT9P111_MANUAL_FOCUS_3:
+	case MT9P111_MANUAL_FOCUS_4:
+	case MT9P111_MANUAL_FOCUS_5:
+	case MT9P111_MANUAL_FOCUS_6:
+	case MT9P111_MANUAL_FOCUS_7:
+	case MT9P111_MANUAL_FOCUS_8:
+	case MT9P111_MANUAL_FOCUS_9:
+	case MT9P111_MANUAL_FOCUS_10:
+		mt9t111_set_manual_focus(client, focus);
+		break;
+	}
+*/
+	int ret = -1;//shanghai ewada
+	int i;
+	
+	if (focus == FULL_SCAN_AUTO_FOCUS_EXECUTION)
+	{
+		mt9p111_set_full_scan_auto_focus_execution(client);
+	}
+	else 
+	{
+		if (focus == INFINITY_MODE)
+			mt9t111_set_manual_focus(client, MT9P111_MANUAL_FOCUS_10);
+		else if (focus == MACRO_MODE) 
+			mt9t111_set_manual_focus(client, MT9P111_MANUAL_FOCUS_1);
+	}
+
+	return 0;
+}
+
+static int mt9p111_set_effect(struct i2c_client *client, int effect)
+{
+	int size;
+	int data;
+	int i;
+
+	switch(effect)
+	{
+	case MT9P111_EFFECT_NONE:
+		size = (sizeof(mt9p111_effect_none) / sizeof(mt9p111_effect_none[0]));
+		mt9p111_reg_write_array(client, mt9p111_effect_none, size);
+		break;
+	case MT9P111_EFFECT_GRAY:
+		size = (sizeof(mt9p111_effect_gray) / sizeof(mt9p111_effect_gray[0]));
+		mt9p111_reg_write_array(client, mt9p111_effect_gray, size);
+		break;
+	case MT9P111_EFFECT_SEPIA:
+		size = (sizeof(mt9p111_effect_sepia) / sizeof(mt9p111_effect_sepia[0]));
+		mt9p111_reg_write_array(client, mt9p111_effect_sepia, size);
+		break;
+	case MT9P111_EFFECT_NEGATIVE:
+		size = (sizeof(mt9p111_effect_negative) / sizeof(mt9p111_effect_negative[0]));
+		mt9p111_reg_write_array(client, mt9p111_effect_negative, size);
+		break;
+	case MT9P111_EFFECT_SOLARIZE:
+		size = (sizeof(mt9p111_effect_solarize) / sizeof(mt9p111_effect_solarize[0]));
+		mt9p111_reg_write_array(client, mt9p111_effect_solarize, size);
+		break;
+	}
+	msleep(10);
+
+	for (i=0; i<100; i++)
+	{
+		data = mt9p111_reg_read_byte(client, 0x8404);
+		if (0x00 == data)
+		{
+			break;
+		}
+		msleep(10);
+	}
+
+	return 0;
+}
+
+static int mt9p111_set_movie(struct i2c_client *client, int movie)
+{
+	int size;
+	int data;
+	int i;
+
+	switch(movie)
+	{
+	case MT9P111_SNAPSHOT_MODE:
+		size = (sizeof(mt9p111_snapshot_mode) / sizeof(mt9p111_snapshot_mode[0]));
+		mt9p111_reg_write_array(client, mt9p111_snapshot_mode, size);
+		break;
+	case MT9P111_MOVIE_MODE:
+		size = (sizeof(mt9p111_movie_mode) / sizeof(mt9p111_movie_mode[0]));
+		mt9p111_reg_write_array(client, mt9p111_movie_mode, size);
+		break;
+	}
+	msleep(10);
+
+	for (i=0; i<100; i++)
+	{
+		data = mt9p111_reg_read_byte(client, 0x8404);
+		if (0x00 == data)
+		{
+			break;
+		}
+		msleep(10);
+	}
+
+	return 0;
+}
+
+static int mt9p111_set_reflect(struct i2c_client *client, int reflect)
+{
+	int size;
+	int data;
+	int i;
+
+	switch(reflect)
+	{
+	case MT9P111_REFLECT_NONE:
+		size = (sizeof(mt9p111_reflect_none) / sizeof(mt9p111_reflect_none[0]));
+		mt9p111_reg_write_array(client, mt9p111_reflect_none, size);
+		break;
+	case MT9P111_REFLECT_MIRROR:
+		size = (sizeof(mt9p111_reflect_mirror) / sizeof(mt9p111_reflect_mirror[0]));
+		mt9p111_reg_write_array(client, mt9p111_reflect_mirror, size);
+		break;
+	case MT9P111_REFLECT_WATER:
+		size = (sizeof(mt9p111_reflect_water) / sizeof(mt9p111_reflect_water[0]));
+		mt9p111_reg_write_array(client, mt9p111_reflect_water, size);
+		break;
+	case MT9P111_REFLECT_MIRROR_WATER:
+		size = (sizeof(mt9p111_reflect_mirror_water) / sizeof(mt9p111_reflect_mirror_water[0]));
+		mt9p111_reg_write_array(client, mt9p111_reflect_mirror_water, size);
+		break;
+	}
+	msleep(10);
+
+	for (i=0; i<100; i++)
+	{
+		data = mt9p111_reg_read_byte(client, 0x8404);
+		if (0x00 == data)
+		{
+			break;
+		}
+		msleep(10);
+	}
+
+	return 0;
+}
+
+static int mt9p111_set_scene(struct i2c_client *client, int scene)
+{
+	int size;
+	int data;
+	int i;
+
+	size = (sizeof(mt9p111_scene) / sizeof(mt9p111_scene[0]));
+	mt9p111_reg_write_array(client, mt9p111_scene, size);
+	msleep(10);
+
+	for (i=0; i<100; i++)
+	{
+		data = mt9p111_reg_read_byte(client, 0x8404);
+		if (0x00 == data)
+		{
+			break;
+		}
+		msleep(10);
+	}
+
+	switch(scene)
+	{
+	case MT9P111_NORMAL:
+		size = (sizeof(mt9p111_normal) / sizeof(mt9p111_normal[0]));
+		mt9p111_reg_write_array(client, mt9p111_normal, size);
+		break;
+	case MT9P111_PORTRAIT:
+		size = (sizeof(mt9p111_portrait) / sizeof(mt9p111_portrait[0]));
+		mt9p111_reg_write_array(client, mt9p111_portrait, size);
+		break;
+	case MT9P111_LANDSCAPE:
+		size = (sizeof(mt9p111_landscape) / sizeof(mt9p111_landscape[0]));
+		mt9p111_reg_write_array(client, mt9p111_landscape, size);
+		break;
+	case MT9P111_INDOOR:
+		size = (sizeof(mt9p111_indoor) / sizeof(mt9p111_indoor[0]));
+		mt9p111_reg_write_array(client, mt9p111_indoor, size);
+		break;
+	case MT9P111_NIGHT:
+		size = (sizeof(mt9p111_night) / sizeof(mt9p111_night[0]));
+		mt9p111_reg_write_array(client, mt9p111_night, size);
+		break;
+	case MT9P111_SPORTS:
+		size = (sizeof(mt9p111_sports) / sizeof(mt9p111_sports[0]));
+		mt9p111_reg_write_array(client, mt9p111_sports, size);
+		break;
+	case MT9P111_WINTER:
+		size = (sizeof(mt9p111_winter) / sizeof(mt9p111_winter[0]));
+		mt9p111_reg_write_array(client, mt9p111_winter, size);
+		break;
+	case MT9P111_TEXT:
+		size = (sizeof(mt9p111_text) / sizeof(mt9p111_text[0]));
+		mt9p111_reg_write_array(client, mt9p111_text, size);
+		break;
+	case MT9P111_SUNSET:
+		size = (sizeof(mt9p111_sunset) / sizeof(mt9p111_sunset[0]));
+		mt9p111_reg_write_array(client, mt9p111_sunset, size);
+		break;
+	case MT9P111_BEACH:
+		size = (sizeof(mt9p111_beach) / sizeof(mt9p111_beach[0]));
+		mt9p111_reg_write_array(client, mt9p111_beach, size);
+		break;
+	case MT9P111_PARTY:
+		size = (sizeof(mt9p111_party) / sizeof(mt9p111_party[0]));
+		mt9p111_reg_write_array(client, mt9p111_party, size);
+		break;
+	}
+	msleep(10);
+
+	for (i=0; i<100; i++)
+	{
+		data = mt9p111_reg_read_byte(client, 0x8404);
+		if (0x00 == data)
+		{
+			break;
+		}
+		msleep(10);
+	}
+
+	return 0;
+}
+
+static int mt9p111_set_iso(struct i2c_client *client, int iso)
+{
+	int size;
+	int data;
+	int i;
+
+	switch(iso)
+	{
+#if 0
+	case MT9P111_SOC_ISO_50:
+		size = (sizeof(mt9p111_SOC_ISO_50_old) / sizeof(mt9p111_SOC_ISO_50_old[0]));
+		mt9p111_reg_write_array(client, mt9p111_SOC_ISO_50_old, size);
+		break;
+#endif
+	case MT9P111_SOC_ISO_100:
+		size = (sizeof(mt9p111_SOC_ISO_100) / sizeof(mt9p111_SOC_ISO_100[0]));
+		mt9p111_reg_write_array(client, mt9p111_SOC_ISO_100, size);
+		break;
+	case MT9P111_SOC_ISO_200:
+		size = (sizeof(mt9p111_SOC_ISO_200) / sizeof(mt9p111_SOC_ISO_200[0]));
+		mt9p111_reg_write_array(client, mt9p111_SOC_ISO_200, size);
+		break;
+	case MT9P111_SOC_ISO_400:
+		size = (sizeof(mt9p111_SOC_ISO_400) / sizeof(mt9p111_SOC_ISO_400[0]));
+		mt9p111_reg_write_array(client, mt9p111_SOC_ISO_400, size);
+		break;
+	case MT9P111_SOC_ISO_800:
+		size = (sizeof(mt9p111_SOC_ISO_800) / sizeof(mt9p111_SOC_ISO_800[0]));
+		mt9p111_reg_write_array(client, mt9p111_SOC_ISO_800, size);
+		break;
+	
+	case MT9P111_SOC_ISO_AUTO:
+	default:
+		size = (sizeof(mt9p111_SOC_ISO_Auto) / sizeof(mt9p111_SOC_ISO_Auto[0]));
+		mt9p111_reg_write_array(client, mt9p111_SOC_ISO_Auto, size);
+		break;
+	}
+
+	msleep(10);
+
+	for (i=0; i<100; i++)
+	{
+		data = mt9p111_reg_read_byte(client, 0x8404);
+		if (0x00 == data)
+		{
+			break;
+		}
+		msleep(10);
+	}
+	return 0;
+}
+
+
+static int mt9p111_set_frame_rate(struct i2c_client *client, int fps)
+{
+	int ret = 0;
+	int size = 0;
+	int i = 0;
+	switch(fps)
+	{
+		case MT9P111_FRAME_RATE_7FPS:
+			//liujianhua add to set fix 7fps
+			size = (sizeof(mt9p111_set_fix_preview_7fps) / sizeof(mt9p111_set_fix_preview_7fps[0]));
+			mt9p111_reg_write_array(client, mt9p111_set_fix_preview_7fps, size);
+			break;
+		case MT9P111_FRAME_RATE_15FPS:
+			//liujianhua add to set fix 7fps
+			size = (sizeof(mt9p111_set_fix_preview_15fps) / sizeof(mt9p111_set_fix_preview_15fps[0]));
+			mt9p111_reg_write_array(client, mt9p111_set_fix_preview_15fps, size);
+			break;
+		case MT9P111_FRAME_RATE_20FPS:
+			//liujianhua add to set fix 7fps
+			size = (sizeof(mt9p111_set_fix_preview_20fps) / sizeof(mt9p111_set_fix_preview_20fps[0]));
+			mt9p111_reg_write_array(client, mt9p111_set_fix_preview_20fps, size);
+			break;
+		case MT9P111_FRAME_RATE_AUTO:
+		default:
+			//liujianhua add to set variable fps
+			size = (sizeof(mt9p111_set_variable_fps_preview) / sizeof(mt9p111_set_variable_fps_preview[0]));
+			mt9p111_reg_write_array(client, mt9p111_set_variable_fps_preview, size);
+			break;
+	}
+	
+	for (i=0; i<100; i++)
+	{
+		int data = mt9p111_reg_read_byte(client, 0x8404);
+		if (0x00 == data)	{
+			break;
+		}	
+		msleep(10);
+	}
+	return 0;
+}
+
+static int mt9p111_g_ctrl(struct v4l2_subdev *sd, struct v4l2_control *ctrl)
+{
+	struct i2c_client *client = sd->priv;
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+	int data;
+
+	switch (ctrl->id) {
+	case V4L2_CID_VFLIP:
+		if (mt9p111->context == HIGHPOWER)
+			data = reg_read(READ_MODE_B);
+		else
+			data = reg_read(READ_MODE_A);
+
+		if (data < 0)
+			return -EIO;
+		ctrl->value = !!(data & MT9P111_RMB_MIRROR_ROWS);
+		break;
+	case V4L2_CID_HFLIP:
+		if (mt9p111->context == HIGHPOWER)
+			data = reg_read(READ_MODE_B);
+		else
+			data = reg_read(READ_MODE_A);
+
+		if (data < 0)
+			return -EIO;
+		ctrl->value = !!(data & MT9P111_RMB_MIRROR_COLS);
+		break;
+	case V4L2_CID_GAIN:
+		data = mt9p111_get_global_gain(client);
+		if (data < 0)
+			return data;
+		ctrl->value = data;
+		break;
+	case V4L2_CID_EXPOSURE_AUTO:
+		ctrl->value = mt9p111->autoexposure;
+		break;
+	case V4L2_CID_AUTO_WHITE_BALANCE:
+		ctrl->value = mt9p111->autowhitebalance;
+		break;
+	case V4L2_CID_CAMERA_GET_AUTOFOCUS_STATUS:
+		ctrl->value = mt9t111_get_autofocus_status(client);
+		if(ctrl->value < 0)
+			return ctrl->value;
+		break;
+	//case V4L2_CID_FLASH_AUTO:
+	case V4L2_CID_CAMERA_GET_FLASH_ONOFF:		
+		printk("%s get flash status from sensor\n", __FUNCTION__);
+		data = mt9p111_reg_read(client, 0xBC0C);
+		ctrl->value = data;
+		break;
+	}
+	return 0;
+}
+
+static int mt9p111_s_ctrl(struct v4l2_subdev *sd, struct v4l2_control *ctrl)
+{
+	struct i2c_client *client = sd->priv;
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+	int ret;
+	int value;
+	
+	//printk("%s line=%d, id=0x%x\n", __FUNCTION__, __LINE__, ctrl->id);
+
+	switch (ctrl->id) {
+	case V4L2_CID_AUTO_WHITE_BALANCE:
+	case V4L2_CID_WHITE_BALANCE_PRESET:
+		//ret =  mt9p111_set_autowhitebalance(client, ctrl->value);
+		if (V4L2_CID_WHITE_BALANCE_PRESET == ctrl->id)
+		{
+			switch(ctrl->value)
+			{
+			case 0:
+				value = MT9P111_WB_INCANDESCENT;
+				break;
+			case 1:
+				value = MT9P111_WB_FLUORESCENT;
+				break;
+			case 2:
+				value = MT9P111_WB_DAYLIGHT;
+				break;
+			case 3:
+				value = MT9P111_WB_CLOUDY;
+				break;
+			}
+		}
+		else
+		{
+			value = MT9P111_WB_AUTO;
+		}
+		ret =  mt9p111_set_whitebalance(client, value);
+		break;
+	case V4L2_CID_EXPOSURE:
+		switch (ctrl->value)
+		{
+		case -4:
+			value = MT9P111_BRIGHT_REDUCE2;
+			break;
+		case -3:
+			value = MT9P111_BRIGHT_REDUCE1_5;
+			break;
+		case -2:
+			value = MT9P111_BRIGHT_REDUCE1;
+			break;
+		case -1:
+			value = MT9P111_BRIGHT_REDUCE0_5;
+			break;
+		case 0:
+			value = MT9P111_BRIGHT_0;
+			break;
+		case 1:
+			value = MT9P111_BRIGHT_INCREASE0_5;
+			break;
+		case 2:
+			value = MT9P111_BRIGHT_INCREASE1;
+			break;
+		case 3:
+			value = MT9P111_BRIGHT_INCREASE1_5;
+			break;
+		case 4:
+			value = MT9P111_BRIGHT_INCREASE2;
+			break;
+		}
+		ret =  mt9p111_set_bright(client, value);
+		break;
+	//case V4L2_CID_CAPTURE:
+	case V4L2_CID_CAM_CAPTURE:	
+		ret =  mt9p111_set_capture_resolution(client, ctrl->value);
+		break;
+	//case V4L2_CID_FOCUS_MODE:
+	case V4L2_CID_CAMERA_FOCUS_MODE:
+		ret =  mt9t111_set_focus(client, ctrl->value);
+		break;
+	case V4L2_CID_FOCUS_AUTO://shanghai ewada
+	    ret =  mt9t111_set_focus(client, FULL_SCAN_AUTO_FOCUS_EXECUTION);
+		break;
+	case V4L2_CID_COLORFX:
+		ret =  mt9p111_set_effect(client, ctrl->value);
+		break;
+	//case V4L2_CID_SCENEMODE:
+	case V4L2_CID_CAMERA_SCENE_MODE:
+		ret =  mt9p111_set_scene(client, ctrl->value);
+		break;
+	case V4L2_CID_CAM_PREVIEW_ONOFF:
+		ret = mt9p111_set_preview_mode(client, ctrl->value);
+		break;
+	case V4L2_CID_CAM_ISO:	
+		ret = mt9p111_set_iso(client,ctrl->value);
+		break;
+	case V4L2_CID_CAMERA_SET_CAMERA_FRAME_RATE:
+		ret = mt9p111_set_frame_rate(client,ctrl->value);
+		break;
+	default:
+		ret = -EINVAL;
+	}
+
+	return ret;
+	
+}
+
+static int mt9p111_suspend(struct soc_camera_device *icd, pm_message_t state)
+{
+	struct i2c_client *client = to_i2c_client(to_soc_camera_control(icd));
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+
+	mt9p111->gain = mt9p111_get_global_gain(client);
+
+	return 0;
+}
+
+static int mt9p111_restore_state(struct i2c_client *client)
+{
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+
+	mt9p111_set_context(client, mt9p111->context);
+	mt9p111_set_pixfmt(client, mt9p111->pixfmt);
+	mt9p111_setup_rect(client, &mt9p111->rect);
+	mt9p111_set_flip(client, mt9p111->hflip, MT9P111_RMB_MIRROR_COLS);
+	mt9p111_set_flip(client, mt9p111->vflip, MT9P111_RMB_MIRROR_ROWS);
+	mt9p111_set_global_gain(client, mt9p111->gain);
+	mt9p111_set_autoexposure(client, mt9p111->autoexposure);
+	mt9p111_set_autowhitebalance(client, mt9p111->autowhitebalance);
+	return 0;
+}
+
+static int mt9p111_resume(struct soc_camera_device *icd)
+{
+	struct i2c_client *client = to_i2c_client(to_soc_camera_control(icd));
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+	int ret = 0;
+
+	if (mt9p111->powered) {
+		ret = mt9p111_enable(client);
+		if (!ret)
+			ret = mt9p111_reset(client);
+		if (!ret)
+			ret = mt9p111_restore_state(client);
+	}
+	return ret;
+}
+
+static int mt9p111_init(struct i2c_client *client)
+{
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+	int ret;
+	printk("..........%s line=%d \n", __FUNCTION__, __LINE__);
+
+	mt9p111->context = HIGHPOWER;
+	ret = mt9p111_enable(client);
+	if (!ret)
+		ret = mt9p111_reset(client);
+	if (!ret)
+		ret = mt9p111_set_context(client, mt9p111->context);
+	if (!ret)
+		ret = mt9p111_set_autoexposure(client, mt9p111->autoexposure);
+	if (ret)
+		dev_err(&client->dev, "mt9m11x init failed: %d\n", ret);
+	return ret;
+}
+
+/*
+ * Interface active, can use i2c. If it fails, it can indeed mean, that
+ * this wasn't our capture interface, so, we wait for the right one
+ */
+static int mt9p111_video_probe(struct soc_camera_device *icd,
+			       struct i2c_client *client)
+{
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+	s32 data;
+	int ret;
+
+	/*
+	 * We must have a parent by now. And it cannot be a wrong one.
+	 * So this entire test is completely redundant.
+	 */
+	if (!icd->dev.parent ||
+	    to_soc_camera_host(icd->dev.parent)->nr != icd->iface)
+		return -ENODEV;
+
+	mt9p111->autoexposure = 1;
+	mt9p111->autowhitebalance = 1;
+
+	mt9p111->swap_rgb_even_odd = 1;
+	mt9p111->swap_rgb_red_blue = 1;
+
+	ret = mt9p111_init(client);
+	if (ret)
+		goto ei2c;
+
+	data = reg_read(CHIP_VERSION);
+
+	switch (data) {
+#if 0
+	case 0x143a: /* MT9P111 */
+		mt9p111->model = V4L2_IDENT_MT9P111;
+		break;
+	case 0x148c: /* MT9M112 */
+		mt9p111->model = V4L2_IDENT_MT9M112;
+		break;
+#endif
+	case 0x2880:
+		mt9p111->model = V4L2_IDENT_MT9P111;
+		break;
+	default:
+		ret = -ENODEV;
+		dev_err(&client->dev,
+			"No MT9M11x chip detected, register read %x\n", data);
+		goto ei2c;
+	}
+
+	icd->formats = mt9p111_colour_formats;
+	icd->num_formats = ARRAY_SIZE(mt9p111_colour_formats);
+
+	dev_info(&client->dev, "Detected a MT9M11x chip ID %x\n", data);
+
+ei2c:
+	return ret;
+}
+
+#include <plat/gpio-cfg.h>
+/*Shanghai ewada camera power*/
+static void  mt9p111_hw_reset(int time);
+static void  mt9p111_hw_reset(int time)
+{
+	int reset = S5PV210_GPH0(2);
+	int err = gpio_request(reset, "cam reset");
+	if (err) printk("mt9p111_hw_reset get gpio error \n");
+	gpio_direction_output(reset, 0);
+	udelay(time);
+	gpio_direction_output(reset, 1);
+	gpio_free(reset);
+}
+
+static void mt9p111_pre_init(struct i2c_client *client)
+{
+	mt9p111_reg_write(client, 0x0020, 0x0020);
+	mdelay(2);
+	mt9p111_hw_reset(3);
+	udelay(40);
+	mt9p111_reg_write(client, 0x0020, 0x0020);
+	mdelay(1);
+}
+
+//fix mt9p111 and mt9m113 camera output issue:
+extern void fimc_cap_rot_flip_patch(u32 rot, u32 flip);
+
+static int mt9p111_sub_dev_init(struct v4l2_subdev *sd, u32 val)
+{
+	struct i2c_client *client = v4l2_get_subdevdata(sd);
+	int  i1,i2,i3,i4,i5,i6,i7,i8,i9;
+	int data;
+	int size;
+	int err;
+	struct mt9p111_reg_cfg 	*p_cfg;
+
+	v4l_info(client, "%s: camera initialization start\n", __func__);
+#if 0
+	for (i = 0; i < S5K4BA_INIT_REGS; i++) {
+		err = s5k4ba_i2c_write(sd, s5k4ba_init_reg[i], \
+					sizeof(s5k4ba_init_reg[i]));
+		if (err < 0)
+			v4l_info(client, "%s: register set failed\n", \
+			__func__);
+	}
+
+	if (err < 0) {
+		v4l_err(client, "%s: camera initialization failed\n", \
+			__func__);
+		return -EIO;	/* FIXME */
+	}
+#endif
+	//mt9p111_sensor_power(1);
+	
+	/*Shanghai ewada camera power*/ 
+	mt9p111_pre_init(client);
+	
+	////rotate 0 degree, xy flip
+	fimc_cap_rot_flip_patch(0, 0x1 | 0x2);
+    
+	for (i1 = 0; i1 < 10; i1++)
+	{
+		data = reg_read(CHIP_VERSION);
+		if (data ==0x2880)
+		{
+			break;
+		}
+		msleep(10);
+	//	printk(" ................ 111111111 CHIP_VERSION=%x \n", data);
+	}
+	printk(" .................CHIP_VERSION=%x %d \n", data, data);
+
+	size = (sizeof(mt9p111_init0) / sizeof(mt9p111_init0[0]));
+	mt9p111_reg_write_array(client, mt9p111_init0, size);
+	for (i2 = 0; i2 < 100; i2++)
+	{
+		data = mt9p111_reg_read(client, 0x0018);
+		if (data == 0x2008)
+		{
+			break;
+		}
+		msleep(10);
+	//	printk(" ................ 111111111 reg0x0018=%x \n", data);
+	}
+
+	size = (sizeof(mt9p111_init1) / sizeof(mt9p111_init1[0]));
+	mt9p111_reg_write_array(client, mt9p111_init1, size);
+//liujianhua add for burst mode test
+#if 0  //move to after 1_3
+	for (i = 0; i < 100; i++)
+	{
+		data = mt9p111_reg_read_byte(client, 0x800A);
+	//	printk(" ................0x800A=%x \n", data);
+		if (data == 0x07)//0x0706)
+		{
+			break;
+		}
+		msleep(10);
+	}
+#endif
+
+#if 0  //non busrt mode
+	size = (sizeof(mt9p111_init1_2) / sizeof(mt9p111_init1_2[0]));
+	mt9p111_reg_write_array(client, mt9p111_init1_2, size);
+
+#else  //burst mode
+	size = (sizeof(mt9p111_init1_2_burst) / sizeof(mt9p111_init1_2_burst[0]));
+	mt9p111_reg_write_burst_array(client, mt9p111_init1_2_burst, size);
+       
+#endif
+	size = (sizeof(mt9p111_init1_3) / sizeof(mt9p111_init1_3[0]));
+	mt9p111_reg_write_array(client, mt9p111_init1_3, size);
+//the check is move to here	
+	for (i3 = 0; i3 < 100; i3++)
+	{
+		data = mt9p111_reg_read_byte(client, 0x800A);
+	//	printk(" ................0x800A=%x \n", data);
+		if (data == 0x07)//0x0706)
+		{
+			break;
+		}
+		msleep(10);
+	}
+//liujianhua burst mode over
+	
+	size = (sizeof(mt9p111_init2) / sizeof(mt9p111_init2[0]));
+	mt9p111_reg_write_array(client, mt9p111_init2, size);	
+	msleep(200);
+	
+	size = (sizeof(mt9p111_init3) / sizeof(mt9p111_init3[0]));
+	mt9p111_reg_write_array(client, mt9p111_init3, size);
+	
+	data = mt9p111_reg_read_byte(client, 0xE023);
+//	printk(" ................ 111111111 0xE023=%x \n", data);
+	if (data == 0xC1)
+	{
+		size = (sizeof(mt9p111_opt_memory_data_read) / sizeof(mt9p111_opt_memory_data_read[0]));
+		mt9p111_reg_write_array(client, mt9p111_opt_memory_data_read, size);
+	}
+	else
+	{
+		size = (sizeof(mt9p111_defalut_Lens_Correction) / sizeof(mt9p111_defalut_Lens_Correction[0]));
+		mt9p111_reg_write_array(client, mt9p111_defalut_Lens_Correction, size);
+	}
+
+	size = (sizeof(mt9p111_opt_memory_data_zone_load) / sizeof(mt9p111_opt_memory_data_zone_load[0]));
+	mt9p111_reg_write_array(client, mt9p111_opt_memory_data_zone_load, size);
+	for (i4 = 0; i4 < 100; i4++)
+	{
+		data = mt9p111_reg_read_byte(client, 0x8404);
+		if (data == 0x00)
+		{
+			break;
+		}
+		msleep(10);
+	}
+	
+	data = mt9p111_reg_read(client, 0xE026);
+	if (data == 0x0000)
+	{
+		size = (sizeof(mt9p111_opt_zone_0_load) / sizeof(mt9p111_opt_zone_0_load[0]));
+		mt9p111_reg_write_array(client, mt9p111_opt_zone_0_load, size);
+	}
+	else
+	{
+		size = (sizeof(mt9p111_opt_zone_1_load) / sizeof(mt9p111_opt_zone_1_load[0]));
+		mt9p111_reg_write_array(client, mt9p111_opt_zone_1_load, size);
+	}
+
+	size = (sizeof(mt9p111_awb_ccm) / sizeof(mt9p111_awb_ccm[0]));
+	mt9p111_reg_write_array(client, mt9p111_awb_ccm, size);
+	//wait for the core ready 
+	for (i5 = 0; i5 < 100; i5++)
+	{
+		data = mt9p111_reg_read_byte(client, 0x8404);
+		if (data == 0x00)
+		{
+			break;
+		}
+		msleep(10);
+	}
+
+	size = (sizeof(mt9p111_awb_ccm_post) / sizeof(mt9p111_awb_ccm_post[0]));
+	mt9p111_reg_write_array(client, mt9p111_awb_ccm_post, size);
+	//end of initialize
+
+#if 0
+	size = (sizeof(mt9p111_af_trigger) / sizeof(mt9p111_af_trigger[0]));
+	mt9p111_reg_write_array(client, mt9p111_af_trigger, size);
+	for (i6 = 0; i6 < 100; i6++)
+	{
+		data = mt9p111_reg_read_byte(client, 0x8404);
+		if (data == 0x00)
+		{
+			break;
+		}
+		msleep(10);
+	}
+
+	size = (sizeof(mt9p111_af_process) / sizeof(mt9p111_af_process[0]));
+	mt9p111_reg_write_array(client, mt9p111_af_process, size);
+	for (i7 = 0; i7 < 255; i7++)
+	{
+		data = mt9p111_reg_read_byte(client, 0x8404);
+		if (data == 0x00)
+		{
+			break;
+		}
+		msleep(10);
+	}
+	
+	size = (sizeof(mt9p111_preview_power) / sizeof(mt9p111_preview_power[0]));
+	mt9p111_reg_write_array(client, mt9p111_preview_power, size);
+	for (i8 = 0; i8 < 100; i8++)
+	{
+		data = mt9p111_reg_read_byte(client, 0x8404);
+		if (data == 0x00)
+		{
+			break;
+		}
+		msleep(10);
+	}
+
+	size = (sizeof(mt9p111_analog_control) / sizeof(mt9p111_analog_control[0]));
+		mt9p111_reg_write_array(client, mt9p111_analog_control, size);
+
+	size = (sizeof(mt9p111_lens_infinity) / sizeof(mt9p111_lens_infinity[0]));
+	mt9p111_reg_write_array(client, mt9p111_lens_infinity, size);
+	for (i9 = 0; i9 < 100; i9++)
+	{
+		data = mt9p111_reg_read_byte(client, 0x8404);
+		if (data == 0x00)
+		{
+			break;
+		}
+		msleep(10);
+	}
+#endif
+	
+//	printk(" ................ %s  finished  \n", __FUNCTION__);
+	camera_current_preview_width = 1024;
+	return 0;
+}
+
+static int mt9p111_g_parm(struct v4l2_subdev *sd, struct v4l2_streamparm *param)
+{
+	struct i2c_client *client = v4l2_get_subdevdata(sd);
+	int err = 0;
+
+	dev_dbg(&client->dev, "%s\n", __func__);
+
+	return err;
+}
+
+static int mt9p111_s_parm(struct v4l2_subdev *sd, struct v4l2_streamparm *param)
+{
+	struct i2c_client *client = v4l2_get_subdevdata(sd);
+	int err = 0;
+
+	dev_dbg(&client->dev, "%s: numerator %d, denominator: %d\n", \
+		__func__, param->parm.capture.timeperframe.numerator, \
+		param->parm.capture.timeperframe.denominator);
+
+	return err;
+}
+
+
+static int mt9p111_s_config(struct v4l2_subdev *sd, int irq, void *platform_data)
+{
+	return 0;
+}
+
+static struct v4l2_subdev_core_ops mt9p111_subdev_core_ops = {
+	.init = mt9p111_sub_dev_init,
+	.s_config = mt9p111_s_config,
+	.g_ctrl		= mt9p111_g_ctrl,
+	.s_ctrl		= mt9p111_s_ctrl,
+	.g_chip_ident	= mt9p111_g_chip_ident,
+#ifdef CONFIG_VIDEO_ADV_DEBUG
+	.g_register	= mt9p111_g_register,
+	.s_register	= mt9p111_s_register,
+#endif
+};
+
+static struct v4l2_subdev_video_ops mt9p111_subdev_video_ops = {
+	.s_fmt		= mt9p111_s_fmt,
+	.g_fmt		= mt9p111_g_fmt,
+	.try_fmt	= mt9p111_try_fmt,
+	.s_crop		= mt9p111_s_crop,
+	.g_crop		= mt9p111_g_crop,
+	.cropcap	= mt9p111_cropcap,
+	.g_parm    = mt9p111_g_parm,
+	.s_parm    = mt9p111_s_parm,
+};
+
+static struct v4l2_subdev_ops mt9p111_subdev_ops = {
+	.core	= &mt9p111_subdev_core_ops,
+	.video	= &mt9p111_subdev_video_ops,
+};
+
+
+
+static int mt9p111_probe(struct i2c_client *client,
+			 const struct i2c_device_id *did)
+{
+	struct mt9p111 *mt9p111;
+	struct soc_camera_device *icd = client->dev.platform_data;
+	struct i2c_adapter *adapter = to_i2c_adapter(client->dev.parent);
+	struct soc_camera_link *icl;
+	int ret;
+
+	if (!i2c_check_functionality(adapter, I2C_FUNC_SMBUS_WORD_DATA)) {
+		
+		printk("I2C-Adapter doesn't support I2C_FUNC_SMBUS_WORD\n");
+		return -EIO;
+	}
+	
+	#ifdef CONFIG_MX100_IOCTL
+	g_mt9p111_i2c_client = client;
+	#endif
+	
+	//client->flags |=I2C_M_IGNORE_NAK;
+#if 0	
+	mt9p111_sensor_power(1);
+
+	reg_set(RESET, MT9P111_RESET_CHIP_ENABLE);
+
+	mt9p111_reset(client);
+	
+	data = reg_read(CHIP_VERSION);
+
+	printk(" .................CHIP_VERSION=%x \n", data);
+
+	mt9p111_sensor_power(0);
+#endif
+	//struct s5k4ba_state *state;
+	struct v4l2_subdev *sd;
+
+#if 0
+	state = kzalloc(sizeof(struct s5k4ba_state), GFP_KERNEL);
+	if (state == NULL)
+		return -ENOMEM;
+#endif
+	sd = kzalloc(sizeof(struct v4l2_subdev), GFP_KERNEL); //&state->sd;
+	strcpy(sd->name, "mt9p111");
+
+	/* Registering subdev */
+	v4l2_i2c_subdev_init(sd, client, &mt9p111_subdev_ops);
+
+	dev_info(&client->dev, "mt0p111 has been probed\n");
+	return 0;
+	
+	
+	if (!icd) {
+		dev_err(&client->dev, "MT9M11x: missing soc-camera data!\n");
+		return -EINVAL;
+	}
+
+	icl = to_soc_camera_link(icd);
+	if (!icl) {
+		dev_err(&client->dev, "MT9M11x driver needs platform data\n");
+		return -EINVAL;
+	}
+
+	if (!i2c_check_functionality(adapter, I2C_FUNC_SMBUS_WORD_DATA)) {
+		dev_warn(&adapter->dev,
+			 "I2C-Adapter doesn't support I2C_FUNC_SMBUS_WORD\n");
+		return -EIO;
+	}
+
+	mt9p111 = kzalloc(sizeof(struct mt9p111), GFP_KERNEL);
+	if (!mt9p111)
+		return -ENOMEM;
+
+	v4l2_i2c_subdev_init(&mt9p111->subdev, client, &mt9p111_subdev_ops);
+
+	/* Second stage probe - when a capture adapter is there */
+	icd->ops		= &mt9p111_ops;
+	icd->y_skip_top		= 0;
+
+	mt9p111->rect.left	= MT9P111_MIN_DARK_COLS;
+	mt9p111->rect.top	= MT9P111_MIN_DARK_ROWS;
+	mt9p111->rect.width	= MT9P111_MAX_WIDTH;
+	mt9p111->rect.height	= MT9P111_MAX_HEIGHT;
+
+	ret = mt9p111_video_probe(icd, client);
+	if (ret) {
+		icd->ops = NULL;
+		i2c_set_clientdata(client, NULL);
+		kfree(mt9p111);
+	}
+
+	return ret;
+}
+
+static int mt9p111_remove(struct i2c_client *client)
+{
+	struct mt9p111 *mt9p111 = to_mt9p111(client);
+	struct soc_camera_device *icd = client->dev.platform_data;
+
+	icd->ops = NULL;
+	i2c_set_clientdata(client, NULL);
+	client->driver = NULL;
+	kfree(mt9p111);
+
+	return 0;
+}
+
+static const struct i2c_device_id mt9p111_id[] = {
+	{ "mt9p111", 0 },
+	{ }
+};
+MODULE_DEVICE_TABLE(i2c, mt9p111_id);
+
+static struct i2c_driver mt9p111_i2c_driver = {
+	.driver = {
+		.name = "mt9p111",
+	},
+	.probe		= mt9p111_probe,
+	.remove		= mt9p111_remove,
+	.id_table	= mt9p111_id,
+};
+
+static int __init mt9p111_mod_init(void)
+{
+	printk(" \n\n................. mt9p111_mod_init \n");
+	return i2c_add_driver(&mt9p111_i2c_driver);
+}
+
+static void __exit mt9p111_mod_exit(void)
+{
+	i2c_del_driver(&mt9p111_i2c_driver);
+}
+
+//module_init(mt9p111_mod_init);
+late_initcall(mt9p111_mod_init);
+
+module_exit(mt9p111_mod_exit);
+
+MODULE_DESCRIPTION("Micron MT9P111/MT9M112 Camera driver");
+MODULE_AUTHOR("Robert Jarzmik");
+MODULE_LICENSE("GPL");

@@ -1,0 +1,1 @@
+cmd_sound/soc/s3c24xx/snd-soc-smdkv2xx-wm8993.o := /home/sunghun/arm-2009q3/bin/arm-none-linux-gnueabi-ld -EL    -r -o sound/soc/s3c24xx/snd-soc-smdkv2xx-wm8993.o sound/soc/s3c24xx/smdkv2xx_wm8993slv.o 

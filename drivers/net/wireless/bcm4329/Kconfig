@@ -1,0 +1,42 @@
+config BCM4329
+	tristate "Broadcom BCM4329 wireless chip support"
+	depends on WIRELESS_EXT && MMC
+	---help---
+	  This module adds support for wireless adapters based on
+	  Broadcom 4329 chipset.
+
+	  This driver uses the kernel's wireless extensions subsystem.
+
+config BCM4329_WL_RESET_GPIO
+	depends on BCM4329
+	int "BCM4329 WLAN Reset GPIO number"
+	default 20
+
+config BCM4329_FW_PATH
+	depends on BCM4329
+	string "Firmware path"
+	default "/etc/wl/bcm4329.bin"
+	---help---
+	  Path to the firmware file.
+
+config BCM4329_NVRAM_PATH
+	depends on BCM4329
+	string "NVRAM path"
+	default "/etc/wl/nvram.txt"
+	---help---
+	  Path to the nvram file.
+
+config BCM4329_IFACE_NAME
+	depends on BCM4329
+	string "Wireless network interface name"
+	default "wlan"
+
+config BCM4329_DEBUG
+	depends on BCM4329
+	bool "Debug"
+	default n
+
+config BCM4329_SOFTAP
+	depends on BCM4329
+	bool "Support SoftAP function"
+	default y

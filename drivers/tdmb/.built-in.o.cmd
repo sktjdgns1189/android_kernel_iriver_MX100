@@ -1,0 +1,1 @@
+cmd_drivers/tdmb/built-in.o :=  /home/sunghun/arm-2009q3/bin/arm-none-linux-gnueabi-ld -EL    -r -o drivers/tdmb/built-in.o drivers/tdmb/tdmb.o drivers/tdmb/INC_INTERFACE.o drivers/tdmb/INC_PROCESS.o drivers/tdmb/INC_FICDEC.o drivers/tdmb/INC_RF_CTRL500.o drivers/tdmb/INC_QFIFO.o 

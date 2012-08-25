@@ -1,0 +1,1 @@
+cmd_drivers/media/radio/built-in.o :=  /home/sunghun/arm-2009q3/bin/arm-none-linux-gnueabi-ld -EL    -r -o drivers/media/radio/built-in.o drivers/media/radio/Si4709_dev.o drivers/media/radio/Si4709_i2c_drv.o drivers/media/radio/Si4709_main.o 
